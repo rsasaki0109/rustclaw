@@ -19,18 +19,8 @@ pub fn cosine_similarity_simd(a: &[f64], b: &[f64]) -> f64 {
 
     for i in 0..chunks {
         let offset = i * 4;
-        let va = wide::f64x4::new([
-            a[offset],
-            a[offset + 1],
-            a[offset + 2],
-            a[offset + 3],
-        ]);
-        let vb = wide::f64x4::new([
-            b[offset],
-            b[offset + 1],
-            b[offset + 2],
-            b[offset + 3],
-        ]);
+        let va = wide::f64x4::new([a[offset], a[offset + 1], a[offset + 2], a[offset + 3]]);
+        let vb = wide::f64x4::new([b[offset], b[offset + 1], b[offset + 2], b[offset + 3]]);
         dot += va * vb;
         norm_a += va * va;
         norm_b += vb * vb;

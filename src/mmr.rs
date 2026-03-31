@@ -25,7 +25,9 @@ impl Default for MmrConfig {
 pub fn tokenize(text: &str) -> HashSet<String> {
     let re = regex::Regex::new(r"[a-z0-9_]+").unwrap();
     let lower = text.to_lowercase();
-    re.find_iter(&lower).map(|m| m.as_str().to_string()).collect()
+    re.find_iter(&lower)
+        .map(|m| m.as_str().to_string())
+        .collect()
 }
 
 pub fn jaccard_similarity(set_a: &HashSet<String>, set_b: &HashSet<String>) -> f64 {
@@ -87,7 +89,11 @@ pub fn mmr_rerank(items: &[MmrItem], config: &MmrConfig) -> Vec<MmrItem> {
     // lambda == 1.0: pure relevance sort
     if (lambda - 1.0).abs() < f64::EPSILON {
         let mut sorted = items.to_vec();
-        sorted.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         return sorted;
     }
 
@@ -98,7 +104,10 @@ pub fn mmr_rerank(items: &[MmrItem], config: &MmrConfig) -> Vec<MmrItem> {
         .collect();
 
     // Normalize scores to [0, 1]
-    let max_score = items.iter().map(|i| i.score).fold(f64::NEG_INFINITY, f64::max);
+    let max_score = items
+        .iter()
+        .map(|i| i.score)
+        .fold(f64::NEG_INFINITY, f64::max);
     let min_score = items.iter().map(|i| i.score).fold(f64::INFINITY, f64::min);
     let score_range = max_score - min_score;
 
@@ -233,10 +242,21 @@ mod tests {
     #[test]
     fn test_mmr_rerank_disabled() {
         let items = vec![
-            MmrItem { id: "a".into(), score: 0.9, content: "hello world".into() },
-            MmrItem { id: "b".into(), score: 0.8, content: "hello world duplicate".into() },
+            MmrItem {
+                id: "a".into(),
+                score: 0.9,
+                content: "hello world".into(),
+            },
+            MmrItem {
+                id: "b".into(),
+                score: 0.8,
+                content: "hello world duplicate".into(),
+            },
         ];
-        let config = MmrConfig { enabled: false, lambda: 0.7 };
+        let config = MmrConfig {
+            enabled: false,
+            lambda: 0.7,
+        };
         let result = mmr_rerank(&items, &config);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].id, "a");
@@ -245,11 +265,26 @@ mod tests {
     #[test]
     fn test_mmr_rerank_promotes_diversity() {
         let items = vec![
-            MmrItem { id: "a".into(), score: 0.95, content: "rust programming language".into() },
-            MmrItem { id: "b".into(), score: 0.90, content: "rust programming tutorial".into() },
-            MmrItem { id: "c".into(), score: 0.85, content: "python machine learning".into() },
+            MmrItem {
+                id: "a".into(),
+                score: 0.95,
+                content: "rust programming language".into(),
+            },
+            MmrItem {
+                id: "b".into(),
+                score: 0.90,
+                content: "rust programming tutorial".into(),
+            },
+            MmrItem {
+                id: "c".into(),
+                score: 0.85,
+                content: "python machine learning".into(),
+            },
         ];
-        let config = MmrConfig { enabled: true, lambda: 0.3 }; // Heavy diversity
+        let config = MmrConfig {
+            enabled: true,
+            lambda: 0.3,
+        }; // Heavy diversity
         let result = mmr_rerank(&items, &config);
         // With heavy diversity weight, "c" (python/ML) should be promoted
         // because it's different from the rust items

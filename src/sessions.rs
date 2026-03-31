@@ -68,10 +68,7 @@ pub fn list_session_files(session_dir: &Path) -> Vec<std::path::PathBuf> {
         .into_iter()
         .flatten()
         .filter(|e| {
-            e.file_type().is_file()
-                && e.path()
-                    .extension()
-                    .is_some_and(|ext| ext == "jsonl")
+            e.file_type().is_file() && e.path().extension().is_some_and(|ext| ext == "jsonl")
         })
         .map(|e| e.into_path())
         .collect()

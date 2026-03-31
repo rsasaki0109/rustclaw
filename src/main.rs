@@ -8,7 +8,11 @@ use rustclaw::watcher::MemoryWatcher;
 use rustclaw::web::run_web_server;
 
 #[derive(Parser)]
-#[command(name = "rustclaw", version, about = "Memory search engine with hybrid vector/keyword search")]
+#[command(
+    name = "rustclaw",
+    version,
+    about = "Memory search engine with hybrid vector/keyword search"
+)]
 struct Cli {
     /// Workspace directory containing memory files
     #[arg(short, long, default_value = ".")]
@@ -90,7 +94,10 @@ async fn main() {
     let cli = Cli::parse();
 
     let workspace_dir = cli.workspace.canonicalize().unwrap_or_else(|_| {
-        eprintln!("Error: {} is not a valid directory", cli.workspace.display());
+        eprintln!(
+            "Error: {} is not a valid directory",
+            cli.workspace.display()
+        );
         std::process::exit(1);
     });
 

@@ -44,7 +44,10 @@ pub fn apply_temporal_decay_to_score(score: f64, age_in_days: f64, half_life_day
 }
 
 pub fn parse_memory_date_from_path(file_path: &str) -> Option<f64> {
-    let normalized = file_path.replace('\\', "/").trim_start_matches("./").to_string();
+    let normalized = file_path
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string();
     let caps = DATED_MEMORY_PATH_RE.captures(&normalized)?;
 
     let year: i32 = caps[1].parse().ok()?;
@@ -52,7 +55,7 @@ pub fn parse_memory_date_from_path(file_path: &str) -> Option<f64> {
     let day: u32 = caps[3].parse().ok()?;
 
     // Basic date validation
-    if month < 1 || month > 12 || day < 1 || day > 31 {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
 
@@ -70,12 +73,15 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
     let yoe = (y - era * 400) as u64;
     let doy = (153 * m as u64 + 2) / 5 + day as u64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era as i64 * 146097 + doe as i64 - 719468;
+    let days = era * 146097 + doe as i64 - 719468;
     Some(days)
 }
 
 pub fn is_evergreen_memory_path(file_path: &str) -> bool {
-    let normalized = file_path.replace('\\', "/").trim_start_matches("./").to_string();
+    let normalized = file_path
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string();
     if normalized == "MEMORY.md" || normalized == "memory.md" {
         return true;
     }
@@ -85,7 +91,11 @@ pub fn is_evergreen_memory_path(file_path: &str) -> bool {
     !DATED_MEMORY_PATH_RE.is_match(&normalized)
 }
 
-pub fn extract_timestamp(file_path: &str, source: &str, workspace_dir: Option<&Path>) -> Option<f64> {
+pub fn extract_timestamp(
+    file_path: &str,
+    source: &str,
+    workspace_dir: Option<&Path>,
+) -> Option<f64> {
     // Try path-based date first
     if let Some(ts) = parse_memory_date_from_path(file_path) {
         return Some(ts);
@@ -123,14 +133,14 @@ pub fn now_ms() -> f64 {
         * 1000.0
 }
 
-pub fn apply_temporal_decay_to_results<T: HasScorePathSource>(
+pub fn apply_temporal_decay_to_results<T>(
     results: &[T],
     config: &TemporalDecayConfig,
     workspace_dir: Option<&Path>,
     now: Option<f64>,
 ) -> Vec<DecayedResult<T>>
 where
-    T: Clone,
+    T: HasScorePathSource + Clone,
 {
     if !config.enabled {
         return results
@@ -147,8 +157,7 @@ where
     results
         .iter()
         .map(|entry| {
-            let timestamp =
-                extract_timestamp(entry.path(), entry.source(), workspace_dir);
+            let timestamp = extract_timestamp(entry.path(), entry.source(), workspace_dir);
             let decayed_score = match timestamp {
                 Some(ts) => apply_temporal_decay_to_score(
                     entry.score(),

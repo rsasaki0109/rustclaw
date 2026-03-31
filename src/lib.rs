@@ -1,4 +1,5 @@
 pub mod embedding;
+pub mod hnsw;
 pub mod hybrid;
 pub mod internal;
 pub mod manager;

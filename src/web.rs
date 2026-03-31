@@ -1,9 +1,9 @@
 use axum::{
+    Router,
     extract::{Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Json},
     routing::get,
-    Router,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -167,7 +167,10 @@ async fn api_sync(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
-pub async fn run_web_server(workspace_dir: PathBuf, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_web_server(
+    workspace_dir: PathBuf,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
     let config = ManagerConfig {
         workspace_dir,
         ..Default::default()

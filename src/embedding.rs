@@ -125,9 +125,7 @@ impl EmbeddingClient {
         let model = model.unwrap_or_else(|| default_model.to_string());
 
         Ok(Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(60))
-                .build()?,
+            client: Client::builder().timeout(Duration::from_secs(60)).build()?,
             provider,
             api_key,
             model,

@@ -1,9 +1,11 @@
 use std::path::PathBuf;
 
 use crate::embedding::{EmbeddingClient, EmbeddingError};
-use crate::hybrid::{bm25_rank_to_score, build_fts_query, merge_hybrid_results, MergeHybridParams};
+use crate::hnsw::HnswIndex;
+use crate::hybrid::{MergeHybridParams, bm25_rank_to_score, build_fts_query, merge_hybrid_results};
 use crate::internal::{build_file_entry, chunk_markdown, list_memory_files};
 use crate::mmr::MmrConfig;
+use crate::sessions::{build_session_entry, list_session_files};
 use crate::simd::cosine_similarity_simd;
 use crate::sqlite::MemoryDb;
 use crate::temporal_decay::TemporalDecayConfig;
@@ -27,17 +29,20 @@ pub struct MemoryIndexManager {
     db: MemoryDb,
     workspace_dir: PathBuf,
     extra_paths: Vec<PathBuf>,
+    session_dir: Option<PathBuf>,
     chunking: ChunkingConfig,
     vector_weight: f64,
     text_weight: f64,
     mmr: MmrConfig,
     temporal_decay: TemporalDecayConfig,
+    hnsw: std::cell::RefCell<Option<HnswIndex>>,
 }
 
 pub struct ManagerConfig {
     pub db_path: Option<PathBuf>,
     pub workspace_dir: PathBuf,
     pub extra_paths: Vec<PathBuf>,
+    pub session_dir: Option<PathBuf>,
     pub chunking: ChunkingConfig,
     pub vector_weight: f64,
     pub text_weight: f64,
@@ -51,6 +56,7 @@ impl Default for ManagerConfig {
             db_path: None,
             workspace_dir: PathBuf::from("."),
             extra_paths: vec![],
+            session_dir: None,
             chunking: ChunkingConfig::default(),
             vector_weight: 0.7,
             text_weight: 0.3,
@@ -74,11 +80,13 @@ impl MemoryIndexManager {
             db,
             workspace_dir: config.workspace_dir,
             extra_paths: config.extra_paths,
+            session_dir: config.session_dir,
             chunking: config.chunking,
             vector_weight: config.vector_weight,
             text_weight: config.text_weight,
             mmr: config.mmr,
             temporal_decay: config.temporal_decay,
+            hnsw: std::cell::RefCell::new(None),
         })
     }
 
@@ -88,11 +96,13 @@ impl MemoryIndexManager {
             db: MemoryDb::open_in_memory()?,
             workspace_dir,
             extra_paths: vec![],
+            session_dir: None,
             chunking: ChunkingConfig::default(),
             vector_weight: 0.7,
             text_weight: 0.3,
             mmr: MmrConfig::default(),
             temporal_decay: TemporalDecayConfig::default(),
+            hnsw: std::cell::RefCell::new(None),
         })
     }
 
@@ -140,12 +150,54 @@ impl MemoryIndexManager {
             self.db.insert_chunks(&entry.path, &chunks)?;
         }
 
+        // Sync session files (JSONL)
+        if let Some(session_dir) = &self.session_dir {
+            let session_files = list_session_files(session_dir);
+            for file_path in &session_files {
+                let entry = match build_file_entry(file_path, &self.workspace_dir)? {
+                    Some(e) => e,
+                    None => continue,
+                };
+                let session_path = format!("sessions/{}", entry.path);
+                seen_paths.insert(session_path.clone());
+
+                let existing_hash = self.db.get_file_hash(&session_path)?;
+                if existing_hash.as_deref() == Some(&entry.hash) {
+                    unchanged += 1;
+                    continue;
+                }
+
+                if existing_hash.is_some() {
+                    self.db.delete_file(&session_path)?;
+                    updated += 1;
+                } else {
+                    added += 1;
+                }
+
+                self.db
+                    .upsert_file(&session_path, &entry.hash, entry.mtime_ms, entry.size)?;
+
+                let content = std::fs::read_to_string(file_path)?;
+                let session = build_session_entry(&content);
+                if !session.text.is_empty() {
+                    let mut chunks = chunk_markdown(&session.text, &self.chunking);
+                    crate::internal::remap_chunk_lines(&mut chunks, Some(&session.line_map));
+                    self.db.insert_chunks(&session_path, &chunks)?;
+                }
+            }
+        }
+
         // Remove files that no longer exist
         for existing_path in &existing_paths {
             if !seen_paths.contains(existing_path) {
                 self.db.delete_file(existing_path)?;
                 removed += 1;
             }
+        }
+
+        // Invalidate HNSW index on changes
+        if added > 0 || updated > 0 || removed > 0 {
+            *self.hnsw.borrow_mut() = None;
         }
 
         Ok(SyncResult {
@@ -156,6 +208,26 @@ impl MemoryIndexManager {
             total_files: self.db.file_count()?,
             total_chunks: self.db.chunk_count()?,
         })
+    }
+
+    /// Build or rebuild the HNSW index from stored embeddings.
+    pub fn build_hnsw_index(&self) -> Result<usize, ManagerError> {
+        let rows = self.db.get_all_embeddings()?;
+        let vectors: Vec<(usize, Vec<f64>)> = rows
+            .iter()
+            .filter_map(|row| {
+                let emb: Vec<f64> = serde_json::from_str(&row.embedding_json).ok()?;
+                if emb.is_empty() {
+                    return None;
+                }
+                Some((row.id as usize, emb))
+            })
+            .collect();
+
+        let count = vectors.len();
+        let index = HnswIndex::build_from(&vectors);
+        *self.hnsw.borrow_mut() = Some(index);
+        Ok(count)
     }
 
     /// Store embeddings for chunks that don't have them yet.
@@ -233,45 +305,70 @@ impl MemoryIndexManager {
         let mut vector_results = Vec::new();
         let mut keyword_results = Vec::new();
 
-        // Vector search
+        // Vector search (HNSW if available, brute-force fallback)
         if let Some(q_emb) = query_embedding {
-            let all_embeddings = self.db.get_all_embeddings()?;
-            for row in &all_embeddings {
-                let embedding: Vec<f64> = serde_json::from_str(&row.embedding_json)
-                    .unwrap_or_default();
-                if embedding.is_empty() {
-                    continue;
+            let hnsw = self.hnsw.borrow();
+            if let Some(index) = hnsw.as_ref() {
+                // HNSW approximate nearest neighbor search
+                let ann_results = index.search(q_emb, max_results * 2);
+                let all_embeddings = self.db.get_all_embeddings()?;
+                let emb_by_id: std::collections::HashMap<i64, _> =
+                    all_embeddings.iter().map(|r| (r.id, r)).collect();
+                for (db_id, score) in ann_results {
+                    if score >= min_score
+                        && let Some(row) = emb_by_id.get(&(db_id as i64))
+                    {
+                        vector_results.push(HybridVectorResult {
+                            id: format!("{}:{}:{}", row.file_path, row.start_line, row.id),
+                            path: row.file_path.clone(),
+                            start_line: row.start_line,
+                            end_line: row.end_line,
+                            source: "memory".to_string(),
+                            snippet: row.text.clone(),
+                            vector_score: score,
+                        });
+                    }
                 }
-                let score = cosine_similarity_simd(q_emb, &embedding);
-                if score >= min_score {
-                    vector_results.push(HybridVectorResult {
-                        id: format!("{}:{}:{}", row.file_path, row.start_line, row.id),
-                        path: row.file_path.clone(),
-                        start_line: row.start_line,
-                        end_line: row.end_line,
-                        source: "memory".to_string(),
-                        snippet: row.text.clone(),
-                        vector_score: score,
-                    });
+            } else {
+                // Brute-force fallback
+                let all_embeddings = self.db.get_all_embeddings()?;
+                for row in &all_embeddings {
+                    let embedding: Vec<f64> =
+                        serde_json::from_str(&row.embedding_json).unwrap_or_default();
+                    if embedding.is_empty() {
+                        continue;
+                    }
+                    let score = cosine_similarity_simd(q_emb, &embedding);
+                    if score >= min_score {
+                        vector_results.push(HybridVectorResult {
+                            id: format!("{}:{}:{}", row.file_path, row.start_line, row.id),
+                            path: row.file_path.clone(),
+                            start_line: row.start_line,
+                            end_line: row.end_line,
+                            source: "memory".to_string(),
+                            snippet: row.text.clone(),
+                            vector_score: score,
+                        });
+                    }
                 }
             }
         }
 
         // Keyword search (FTS)
-        if let Some(fts_query) = build_fts_query(query) {
-            if let Ok(fts_results) = self.db.search_fts(&fts_query, max_results * 2) {
-                for row in fts_results {
-                    let score = bm25_rank_to_score(row.rank);
-                    keyword_results.push(HybridKeywordResult {
-                        id: format!("{}:{}:{}", row.file_path, row.start_line, row.id),
-                        path: row.file_path,
-                        start_line: row.start_line,
-                        end_line: row.end_line,
-                        source: "memory".to_string(),
-                        snippet: row.text,
-                        text_score: score,
-                    });
-                }
+        if let Some(fts_query) = build_fts_query(query)
+            && let Ok(fts_results) = self.db.search_fts(&fts_query, max_results * 2)
+        {
+            for row in fts_results {
+                let score = bm25_rank_to_score(row.rank);
+                keyword_results.push(HybridKeywordResult {
+                    id: format!("{}:{}:{}", row.file_path, row.start_line, row.id),
+                    path: row.file_path,
+                    start_line: row.start_line,
+                    end_line: row.end_line,
+                    source: "memory".to_string(),
+                    snippet: row.text,
+                    text_score: score,
+                });
             }
         }
 
@@ -441,12 +538,7 @@ mod tests {
         manager.sync().unwrap();
 
         let count = manager
-            .store_embeddings(|texts| {
-                texts
-                    .iter()
-                    .map(|_| vec![0.1, 0.2, 0.3])
-                    .collect()
-            })
+            .store_embeddings(|texts| texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
             .unwrap();
         assert!(count > 0);
 

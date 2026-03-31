@@ -7,10 +7,13 @@ Rust port of [OpenClaw](https://github.com/openclaw/openclaw)'s memory system.
 ## Features
 
 - **Hybrid Search** - Combines FTS5 keyword search (BM25) with vector similarity search
+- **HNSW Index** - Approximate nearest neighbor search for fast vector queries
 - **MMR Re-ranking** - Maximal Marginal Relevance for diversity-aware results
 - **Temporal Decay** - Exponential time decay with configurable half-life
 - **SIMD Cosine Similarity** - Vectorized similarity computation via `wide`
+- **Incremental Embedding** - Only embeds new/changed chunks
 - **Embedding API** - OpenAI and Gemini embedding integration
+- **Session Indexing** - JSONL conversation log parsing and search
 - **MCP Server** - Model Context Protocol server for Claude Code integration
 - **Web UI** - Browser-based search interface with live results
 - **File Watcher** - Auto-sync on memory file changes via `notify`
@@ -55,7 +58,7 @@ rustclaw -w /path/to/workspace serve --port 3179
 
 ### MCP Server (Claude Code Integration)
 
-Add to your Claude Code MCP config:
+Add to your Claude Code MCP config (`~/.claude/settings.json`):
 
 ```json
 {
@@ -80,17 +83,31 @@ Available tools:
 rustclaw
 ├── internal.rs        # Markdown chunking, hashing, file scanning
 ├── sqlite.rs          # SQLite storage + FTS5 full-text search
+├── hnsw.rs            # HNSW approximate nearest neighbor index
 ├── simd.rs            # SIMD-accelerated cosine similarity
 ├── mmr.rs             # Maximal Marginal Relevance re-ranking
 ├── temporal_decay.rs  # Exponential time decay scoring
 ├── hybrid.rs          # Vector + keyword search merge (BM25)
 ├── embedding.rs       # OpenAI / Gemini embedding API client
 ├── sessions.rs        # JSONL session file parser
-├── manager.rs         # Orchestrator (sync, search, embed)
+├── manager.rs         # Orchestrator (sync, search, embed, HNSW)
 ├── mcp.rs             # MCP server (JSON-RPC over stdio)
 ├── web.rs             # Web UI (axum)
 ├── watcher.rs         # File change watcher (notify)
 └── main.rs            # CLI (clap)
+```
+
+### Search Pipeline
+
+```
+Query
+  ├─ FTS5 keyword search (BM25 scoring)
+  ├─ Vector search (HNSW or brute-force)
+  │    └─ SIMD cosine similarity
+  ├─ Hybrid merge (weighted combination)
+  ├─ Temporal decay (exponential half-life)
+  └─ MMR re-ranking (diversity)
+  → Results
 ```
 
 ## Memory File Format
@@ -100,10 +117,12 @@ rustclaw indexes markdown files following the OpenClaw memory convention:
 ```
 workspace/
 ├── MEMORY.md          # Main index file
-└── memory/
-    ├── topic_a.md     # Topic files
-    ├── topic_b.md
-    └── 2024-03-15.md  # Dated files (subject to temporal decay)
+├── memory/
+│   ├── topic_a.md     # Topic files
+│   ├── topic_b.md
+│   └── 2024-03-15.md  # Dated files (subject to temporal decay)
+└── sessions/          # Optional: JSONL conversation logs
+    └── chat.jsonl
 ```
 
 ## Benchmarks

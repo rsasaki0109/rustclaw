@@ -1,5 +1,5 @@
-use crate::mmr::{apply_mmr_to_hybrid_results, MmrConfig};
-use crate::temporal_decay::{apply_temporal_decay_to_results, TemporalDecayConfig};
+use crate::mmr::{MmrConfig, apply_mmr_to_hybrid_results};
+use crate::temporal_decay::{TemporalDecayConfig, apply_temporal_decay_to_results};
 use crate::types::{HybridKeywordResult, HybridMergedResult, HybridVectorResult};
 use std::collections::HashMap;
 use std::path::Path;
@@ -104,9 +104,7 @@ pub fn merge_hybrid_results(params: MergeHybridParams) -> Vec<HybridMergedResult
         .collect();
 
     // Apply temporal decay
-    let decay_config = params
-        .temporal_decay
-        .unwrap_or_default();
+    let decay_config = params.temporal_decay.unwrap_or_default();
     let workspace = params.workspace_dir.as_ref().map(|s| Path::new(s.as_str()));
 
     let decayed = apply_temporal_decay_to_results(&merged, &decay_config, workspace, params.now_ms);
@@ -121,7 +119,11 @@ pub fn merge_hybrid_results(params: MergeHybridParams) -> Vec<HybridMergedResult
         .collect();
 
     // Sort by score descending
-    merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    merged.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Apply MMR if enabled
     let mmr_config = params.mmr.unwrap_or_default();

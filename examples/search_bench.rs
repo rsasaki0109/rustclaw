@@ -32,8 +32,16 @@ fn bench_cosine_similarity() {
     let simd_time = start.elapsed();
 
     println!("=== Cosine Similarity ({dim}d, {iterations} iterations) ===");
-    println!("  scalar: {:?} ({:.0} ops/sec)", scalar_time, iterations as f64 / scalar_time.as_secs_f64());
-    println!("  SIMD:   {:?} ({:.0} ops/sec)", simd_time, iterations as f64 / simd_time.as_secs_f64());
+    println!(
+        "  scalar: {:?} ({:.0} ops/sec)",
+        scalar_time,
+        iterations as f64 / scalar_time.as_secs_f64()
+    );
+    println!(
+        "  SIMD:   {:?} ({:.0} ops/sec)",
+        simd_time,
+        iterations as f64 / simd_time.as_secs_f64()
+    );
     println!(
         "  speedup: {:.2}x",
         scalar_time.as_secs_f64() / simd_time.as_secs_f64()
@@ -64,7 +72,10 @@ fn bench_search() {
     for (i, topic) in topics.iter().enumerate() {
         let content = format!(
             "# Topic {i}\n{topic}\n\nThis is detailed content about {topic}.\nIt contains multiple lines for chunking.\n{}\n",
-            (0..20).map(|j| format!("Line {j} of topic {i}: {topic}")).collect::<Vec<_>>().join("\n")
+            (0..20)
+                .map(|j| format!("Line {j} of topic {i}: {topic}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         fs::write(memory_dir.join(format!("topic_{i}.md")), content).unwrap();
     }
@@ -82,7 +93,12 @@ fn bench_search() {
         status.files, status.chunks
     );
 
-    let queries = ["rust programming", "machine learning", "container", "database SQL"];
+    let queries = [
+        "rust programming",
+        "machine learning",
+        "container",
+        "database SQL",
+    ];
     let iterations = 1000;
 
     let start = Instant::now();

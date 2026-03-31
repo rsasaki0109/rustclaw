@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::manager::{ManagerConfig, ManagerError, MemoryIndexManager};
 
@@ -122,10 +122,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
-fn make_response(
-    id: Option<serde_json::Value>,
-    result: serde_json::Value,
-) -> JsonRpcResponse {
+fn make_response(id: Option<serde_json::Value>, result: serde_json::Value) -> JsonRpcResponse {
     JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
         id,
@@ -146,7 +143,7 @@ fn make_error(id: Option<serde_json::Value>, code: i64, message: String) -> Json
 fn handle_request(
     req: &JsonRpcRequest,
     manager: &MemoryIndexManager,
-    workspace_dir: &PathBuf,
+    workspace_dir: &Path,
 ) -> JsonRpcResponse {
     match req.method.as_str() {
         "initialize" => make_response(
@@ -186,7 +183,11 @@ fn handle_request(
                     let search_params: SearchParams = match serde_json::from_value(arguments) {
                         Ok(p) => p,
                         Err(e) => {
-                            return make_error(req.id.clone(), -32602, format!("Invalid params: {e}"))
+                            return make_error(
+                                req.id.clone(),
+                                -32602,
+                                format!("Invalid params: {e}"),
+                            );
                         }
                     };
                     match manager.search(
@@ -250,7 +251,11 @@ fn handle_request(
                     let file_params: ReadFileParams = match serde_json::from_value(arguments) {
                         Ok(p) => p,
                         Err(e) => {
-                            return make_error(req.id.clone(), -32602, format!("Invalid params: {e}"))
+                            return make_error(
+                                req.id.clone(),
+                                -32602,
+                                format!("Invalid params: {e}"),
+                            );
                         }
                     };
                     let abs_path = workspace_dir.join(&file_params.path);
@@ -276,17 +281,11 @@ fn handle_request(
                                 }),
                             )
                         }
-                        Err(e) => {
-                            make_error(req.id.clone(), -32000, format!("Read failed: {e}"))
-                        }
+                        Err(e) => make_error(req.id.clone(), -32000, format!("Read failed: {e}")),
                     }
                 }
 
-                _ => make_error(
-                    req.id.clone(),
-                    -32601,
-                    format!("Unknown tool: {tool_name}"),
-                ),
+                _ => make_error(req.id.clone(), -32601, format!("Unknown tool: {tool_name}")),
             }
         }
 

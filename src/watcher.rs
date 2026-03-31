@@ -1,5 +1,5 @@
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -60,7 +60,7 @@ impl MemoryWatcher {
                         let memory_paths: Vec<PathBuf> = event
                             .paths
                             .into_iter()
-                            .filter(|p| is_memory_related(p))
+                            .filter(|p| is_memory_related(p.as_path()))
                             .collect();
 
                         if !memory_paths.is_empty() && last_fire.elapsed() >= debounce {
@@ -90,19 +90,19 @@ impl MemoryWatcher {
     }
 }
 
-fn is_memory_related(path: &PathBuf) -> bool {
+fn is_memory_related(path: &Path) -> bool {
     let path_str = path.to_string_lossy();
 
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        if name == "MEMORY.md" || name == "memory.md" {
-            return true;
-        }
+    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+        && (name == "MEMORY.md" || name == "memory.md")
+    {
+        return true;
     }
 
-    if path_str.contains("/memory/") || path_str.contains("\\memory\\") {
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            return ext == "md";
-        }
+    if (path_str.contains("/memory/") || path_str.contains("\\memory\\"))
+        && let Some(ext) = path.extension().and_then(|e| e.to_str())
+    {
+        return ext == "md";
     }
 
     false
@@ -114,14 +114,10 @@ mod tests {
 
     #[test]
     fn test_is_memory_related() {
-        assert!(is_memory_related(&PathBuf::from("/workspace/MEMORY.md")));
-        assert!(is_memory_related(&PathBuf::from("/workspace/memory.md")));
-        assert!(is_memory_related(&PathBuf::from(
-            "/workspace/memory/topic.md"
-        )));
-        assert!(!is_memory_related(&PathBuf::from("/workspace/src/main.rs")));
-        assert!(!is_memory_related(&PathBuf::from(
-            "/workspace/README.md"
-        )));
+        assert!(is_memory_related(Path::new("/workspace/MEMORY.md")));
+        assert!(is_memory_related(Path::new("/workspace/memory.md")));
+        assert!(is_memory_related(Path::new("/workspace/memory/topic.md")));
+        assert!(!is_memory_related(Path::new("/workspace/src/main.rs")));
+        assert!(!is_memory_related(Path::new("/workspace/README.md")));
     }
 }

@@ -11,7 +11,7 @@ pub fn hash_text(value: &str) -> String {
 }
 
 pub fn normalize_rel_path(value: &str) -> String {
-    let trimmed = value.trim().trim_start_matches(|c| c == '.' || c == '/');
+    let trimmed = value.trim().trim_start_matches(['.', '/']);
     trimmed.replace('\\', "/")
 }
 
@@ -64,7 +64,11 @@ pub fn chunk_markdown(content: &str, config: &ChunkingConfig) -> Vec<MemoryChunk
         }
         let first = &current[0];
         let last = &current[current.len() - 1];
-        let text: String = current.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("\n");
+        let text: String = current
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         chunks.push(MemoryChunk {
             start_line: first.1,
             end_line: last.1,
@@ -296,7 +300,10 @@ mod tests {
     #[test]
     fn test_chunk_markdown_splits() {
         // Small chunk size to force splitting
-        let content = (0..100).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let content = (0..100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let config = ChunkingConfig {
             tokens: 8, // 32 chars max per chunk
             overlap: 0,
