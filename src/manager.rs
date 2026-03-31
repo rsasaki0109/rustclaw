@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 
-use crate::embedding::{EmbeddingClient, EmbeddingError};
+use crate::embedding::{EmbeddingError, EmbeddingProvider};
 use crate::hnsw::HnswIndex;
 use crate::hybrid::{MergeHybridParams, bm25_rank_to_score, build_fts_query, merge_hybrid_results};
 use crate::internal::{build_file_entry, chunk_markdown, list_memory_files};
 use crate::mmr::MmrConfig;
 use crate::sessions::{build_session_entry, list_session_files};
 use crate::simd::cosine_similarity_simd;
-use crate::sqlite::MemoryDb;
+use crate::sqlite::{MemoryDb, StorageError};
 use crate::temporal_decay::TemporalDecayConfig;
 use crate::types::{
     ChunkingConfig, HybridKeywordResult, HybridVectorResult, MemorySearchResult, MemorySource,
@@ -19,6 +19,8 @@ pub enum ManagerError {
     Io(#[from] std::io::Error),
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("Storage error: {0}")]
+    Storage(#[from] StorageError),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("Embedding error: {0}")]
@@ -257,7 +259,7 @@ impl MemoryIndexManager {
     /// Processes chunks in batches to avoid API limits.
     pub async fn embed_and_store(
         &self,
-        client: &EmbeddingClient,
+        client: &dyn EmbeddingProvider,
         batch_size: usize,
     ) -> Result<usize, ManagerError> {
         let chunks = self.db.get_chunks_without_embedding()?;
@@ -285,7 +287,7 @@ impl MemoryIndexManager {
     pub async fn search_with_embedding(
         &self,
         query: &str,
-        client: &EmbeddingClient,
+        client: &dyn EmbeddingProvider,
         max_results: usize,
         min_score: f64,
     ) -> Result<Vec<MemorySearchResult>, ManagerError> {

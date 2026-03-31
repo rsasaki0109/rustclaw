@@ -1,7 +1,10 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use rustclaw::embedding::{EmbeddingClient, EmbeddingProvider};
+use rustclaw::cron::service::{CronService, JobExecutor};
+use rustclaw::cron::store::CronJobStore;
+use rustclaw::cron::types::{CronJob, CronJobState, CronSchedule, JobRunResult, RunStatus};
+use rustclaw::embedding::{EmbeddingProviderKind, create_embedding_provider};
 use rustclaw::manager::{ManagerConfig, MemoryIndexManager};
 use rustclaw::mcp::run_mcp_server;
 use rustclaw::watcher::MemoryWatcher;
@@ -53,7 +56,7 @@ enum Commands {
 
         /// Embedding provider
         #[arg(long, value_enum, default_value = "openai")]
-        provider: EmbeddingProvider,
+        provider: EmbeddingProviderKind,
 
         /// Embedding model override
         #[arg(long)]
@@ -64,7 +67,7 @@ enum Commands {
     Embed {
         /// Embedding provider
         #[arg(long, value_enum, default_value = "openai")]
-        provider: EmbeddingProvider,
+        provider: EmbeddingProviderKind,
 
         /// Embedding model override
         #[arg(long)]
@@ -87,6 +90,34 @@ enum Commands {
         #[arg(short, long, default_value = "3179")]
         port: u16,
     },
+
+    /// Cron job scheduler
+    Cron {
+        #[command(subcommand)]
+        action: CronAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CronAction {
+    /// List all cron jobs
+    List,
+    /// Add a cron job
+    Add {
+        /// Job name
+        name: String,
+        /// Schedule: cron expression, interval (e.g. "5m"), or ISO datetime
+        schedule: String,
+        /// Command to execute
+        command: String,
+    },
+    /// Remove a cron job
+    Remove {
+        /// Job ID
+        id: String,
+    },
+    /// Run the cron scheduler
+    Run,
 }
 
 #[tokio::main]
@@ -165,7 +196,7 @@ async fn main() {
             }
 
             let results = if embed {
-                let client = match EmbeddingClient::new(provider, None, model) {
+                let client = match create_embedding_provider(provider, None, model) {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("Embedding client error: {e}");
@@ -173,7 +204,7 @@ async fn main() {
                     }
                 };
                 manager
-                    .search_with_embedding(&query, &client, max_results, min_score)
+                    .search_with_embedding(&query, client.as_ref(), max_results, min_score)
                     .await
             } else {
                 manager.search(&query, None, max_results, min_score)
@@ -219,7 +250,7 @@ async fn main() {
                 std::process::exit(1);
             }
 
-            let client = match EmbeddingClient::new(provider, None, model) {
+            let client = match create_embedding_provider(provider, None, model) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Embedding client error: {e}");
@@ -228,7 +259,7 @@ async fn main() {
             };
 
             println!("generating embeddings with {provider}...");
-            match manager.embed_and_store(&client, batch_size).await {
+            match manager.embed_and_store(client.as_ref(), batch_size).await {
                 Ok(n) => println!("embedded {n} chunks"),
                 Err(e) => {
                     eprintln!("Embedding failed: {e}");
@@ -296,5 +327,126 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+
+        Commands::Cron { action } => {
+            let store_path = workspace_dir.join(".rustclaw").join("cron_jobs.json");
+            let store = CronJobStore::new(store_path);
+
+            match action {
+                CronAction::List => {
+                    let jobs = store.load().unwrap_or_default();
+                    if jobs.is_empty() {
+                        println!("No cron jobs.");
+                    } else {
+                        for job in &jobs {
+                            let status = if job.enabled { "enabled" } else { "disabled" };
+                            println!(
+                                "  {} [{}] {} | {} | {}",
+                                job.id, status, job.name, job.schedule, job.command
+                            );
+                        }
+                    }
+                }
+                CronAction::Add {
+                    name,
+                    schedule,
+                    command,
+                } => {
+                    let cron_schedule = parse_schedule_str(&schedule);
+                    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+                    let job = CronJob {
+                        id: id.clone(),
+                        name,
+                        schedule: cron_schedule,
+                        command,
+                        enabled: true,
+                        state: CronJobState::default(),
+                        max_retries: 3,
+                    };
+                    store.add_job(job).unwrap();
+                    println!("added job {id}");
+                }
+                CronAction::Remove { id } => {
+                    if store.remove_job(&id).unwrap() {
+                        println!("removed job {id}");
+                    } else {
+                        eprintln!("job {id} not found");
+                        std::process::exit(1);
+                    }
+                }
+                CronAction::Run => {
+                    let executor: JobExecutor = std::sync::Arc::new(|job: &CronJob| {
+                        let output = std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(&job.command)
+                            .output();
+                        match output {
+                            Ok(o) if o.status.success() => JobRunResult {
+                                status: RunStatus::Ok,
+                                error: None,
+                            },
+                            Ok(o) => JobRunResult {
+                                status: RunStatus::Error,
+                                error: Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+                            },
+                            Err(e) => JobRunResult {
+                                status: RunStatus::Error,
+                                error: Some(e.to_string()),
+                            },
+                        }
+                    });
+
+                    let service = CronService::new(store, executor);
+                    println!("cron scheduler running...");
+
+                    let svc = std::sync::Arc::new(service);
+                    let svc_clone = svc.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = svc_clone.run().await {
+                            eprintln!("cron error: {e}");
+                        }
+                    });
+
+                    tokio::signal::ctrl_c().await.ok();
+                    svc.stop();
+                    println!("\nstopping...");
+                }
+            }
+        }
+    }
+}
+
+fn parse_schedule_str(s: &str) -> CronSchedule {
+    // Try interval format: "5m", "1h", "30s"
+    if let Some(interval_ms) = parse_interval(s) {
+        return CronSchedule::Every {
+            every_ms: interval_ms,
+            anchor_ms: None,
+        };
+    }
+    // Try ISO datetime
+    if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+        return CronSchedule::At { at: s.to_string() };
+    }
+    // Default to cron expression
+    CronSchedule::Cron {
+        expr: s.to_string(),
+        tz: None,
+    }
+}
+
+fn parse_interval(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.len() < 2 {
+        return None;
+    }
+    let (num, unit) = s.split_at(s.len() - 1);
+    let n: u64 = num.parse().ok()?;
+    match unit {
+        "s" => Some(n * 1000),
+        "m" => Some(n * 60_000),
+        "h" => Some(n * 3_600_000),
+        "d" => Some(n * 86_400_000),
+        _ => None,
     }
 }

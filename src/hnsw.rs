@@ -253,7 +253,7 @@ mod tests {
 
     fn random_vec(dim: usize, seed: u64) -> Vec<f64> {
         (0..dim)
-            .map(|i| ((i as f64 * seed as f64 * 0.1 + 0.3).sin()))
+            .map(|i| (i as f64 * seed as f64 * 0.1 + 0.3).sin())
             .collect()
     }
 

@@ -3,6 +3,35 @@ use std::path::Path;
 
 use crate::types::MemoryChunk;
 
+/// Trait for pluggable storage backends.
+pub trait StorageBackend {
+    fn upsert_file(
+        &self,
+        path: &str,
+        hash: &str,
+        mtime_ms: f64,
+        size: u64,
+    ) -> Result<(), StorageError>;
+    fn get_file_hash(&self, path: &str) -> Result<Option<String>, StorageError>;
+    fn delete_file(&self, path: &str) -> Result<(), StorageError>;
+    fn insert_chunks(&self, file_path: &str, chunks: &[MemoryChunk]) -> Result<(), StorageError>;
+    fn update_embedding(&self, chunk_id: i64, embedding: &[f64]) -> Result<(), StorageError>;
+    fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<FtsResult>, StorageError>;
+    fn get_all_embeddings(&self) -> Result<Vec<EmbeddingRow>, StorageError>;
+    fn get_chunks_without_embedding(&self) -> Result<Vec<ChunkRow>, StorageError>;
+    fn file_count(&self) -> Result<usize, StorageError>;
+    fn chunk_count(&self) -> Result<usize, StorageError>;
+    fn all_file_paths(&self) -> Result<Vec<String>, StorageError>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StorageError {
+    #[error("SQLite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
 pub struct MemoryDb {
     conn: Connection,
 }
@@ -246,6 +275,52 @@ pub struct ChunkRow {
     pub end_line: usize,
     pub text: String,
     pub hash: String,
+}
+
+impl StorageBackend for MemoryDb {
+    fn upsert_file(
+        &self,
+        path: &str,
+        hash: &str,
+        mtime_ms: f64,
+        size: u64,
+    ) -> Result<(), StorageError> {
+        self.upsert_file(path, hash, mtime_ms, size)?;
+        Ok(())
+    }
+    fn get_file_hash(&self, path: &str) -> Result<Option<String>, StorageError> {
+        Ok(self.get_file_hash(path)?)
+    }
+    fn delete_file(&self, path: &str) -> Result<(), StorageError> {
+        self.delete_file(path)?;
+        Ok(())
+    }
+    fn insert_chunks(&self, file_path: &str, chunks: &[MemoryChunk]) -> Result<(), StorageError> {
+        self.insert_chunks(file_path, chunks)?;
+        Ok(())
+    }
+    fn update_embedding(&self, chunk_id: i64, embedding: &[f64]) -> Result<(), StorageError> {
+        self.update_embedding(chunk_id, embedding)?;
+        Ok(())
+    }
+    fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<FtsResult>, StorageError> {
+        Ok(self.search_fts(query, limit)?)
+    }
+    fn get_all_embeddings(&self) -> Result<Vec<EmbeddingRow>, StorageError> {
+        Ok(self.get_all_embeddings()?)
+    }
+    fn get_chunks_without_embedding(&self) -> Result<Vec<ChunkRow>, StorageError> {
+        Ok(self.get_chunks_without_embedding()?)
+    }
+    fn file_count(&self) -> Result<usize, StorageError> {
+        Ok(self.file_count()?)
+    }
+    fn chunk_count(&self) -> Result<usize, StorageError> {
+        Ok(self.chunk_count()?)
+    }
+    fn all_file_paths(&self) -> Result<Vec<String>, StorageError> {
+        Ok(self.all_file_paths()?)
+    }
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+pub mod cron;
 pub mod embedding;
 pub mod hnsw;
 pub mod hybrid;
