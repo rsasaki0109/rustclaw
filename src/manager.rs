@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
+use crate::embedding::{EmbeddingClient, EmbeddingError};
 use crate::hybrid::{bm25_rank_to_score, build_fts_query, merge_hybrid_results, MergeHybridParams};
-use crate::internal::{build_file_entry, chunk_markdown, cosine_similarity, list_memory_files};
+use crate::internal::{build_file_entry, chunk_markdown, list_memory_files};
 use crate::mmr::MmrConfig;
+use crate::simd::cosine_similarity_simd;
 use crate::sqlite::MemoryDb;
 use crate::temporal_decay::TemporalDecayConfig;
 use crate::types::{
@@ -17,6 +19,8 @@ pub enum ManagerError {
     Sqlite(#[from] rusqlite::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("Embedding error: {0}")]
+    Embedding(#[from] EmbeddingError),
 }
 
 pub struct MemoryIndexManager {
@@ -177,6 +181,47 @@ impl MemoryIndexManager {
         Ok(chunks.len())
     }
 
+    /// Store embeddings using an async embedding API client.
+    /// Processes chunks in batches to avoid API limits.
+    pub async fn embed_and_store(
+        &self,
+        client: &EmbeddingClient,
+        batch_size: usize,
+    ) -> Result<usize, ManagerError> {
+        let chunks = self.db.get_chunks_without_embedding()?;
+        if chunks.is_empty() {
+            return Ok(0);
+        }
+
+        let mut total = 0;
+        for batch in chunks.chunks(batch_size.max(1)) {
+            let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
+            let embeddings = client.embed(&texts).await?;
+
+            for (chunk, embedding) in batch.iter().zip(embeddings.iter()) {
+                if !embedding.is_empty() {
+                    self.db.update_embedding(chunk.id, embedding)?;
+                    total += 1;
+                }
+            }
+        }
+
+        Ok(total)
+    }
+
+    /// Search with async query embedding generation.
+    pub async fn search_with_embedding(
+        &self,
+        query: &str,
+        client: &EmbeddingClient,
+        max_results: usize,
+        min_score: f64,
+    ) -> Result<Vec<MemorySearchResult>, ManagerError> {
+        let query_embedding = client.embed(&[query.to_string()]).await?;
+        let emb = query_embedding.first().map(|v| v.as_slice());
+        self.search(query, emb, max_results, min_score)
+    }
+
     /// Search using hybrid vector + keyword approach
     pub fn search(
         &self,
@@ -197,7 +242,7 @@ impl MemoryIndexManager {
                 if embedding.is_empty() {
                     continue;
                 }
-                let score = cosine_similarity(q_emb, &embedding);
+                let score = cosine_similarity_simd(q_emb, &embedding);
                 if score >= min_score {
                     vector_results.push(HybridVectorResult {
                         id: format!("{}:{}:{}", row.file_path, row.start_line, row.id),

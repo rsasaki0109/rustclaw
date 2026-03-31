@@ -1,7 +1,10 @@
+pub mod embedding;
 pub mod hybrid;
 pub mod internal;
 pub mod manager;
 pub mod mmr;
+pub mod simd;
 pub mod sqlite;
 pub mod temporal_decay;
 pub mod types;
+pub mod watcher;
