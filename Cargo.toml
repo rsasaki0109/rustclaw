@@ -1,13 +1,17 @@
 [package]
 name = "rustclaw"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "Memory search engine with hybrid vector/keyword search, MMR re-ranking, and temporal decay - Rust port of OpenClaw's memory system"
 license = "MIT"
 repository = "https://github.com/rsasaki0109/rustclaw"
 keywords = ["search", "memory", "embedding", "mcp", "fts5"]
 categories = ["text-processing", "database"]
-exclude = [".github/", "examples/", "target/"]
+exclude = [".github/", "target/", "PLAN.md"]
+
+[features]
+default = []
+fastembed = ["dep:fastembed"]
 
 [dependencies]
 sha2 = "0.10"
@@ -28,9 +32,13 @@ async-trait = "0.1"
 cron = "0.13"
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
+toml = "0.8"
+rayon = "1"
+fastembed = { version = "4.9.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
 
 [[example]]
 name = "search_bench"

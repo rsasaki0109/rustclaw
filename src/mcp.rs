@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::cron::store::CronJobStore;
 use crate::cron::types::{CronJob, CronJobState, CronSchedule};
@@ -473,11 +473,8 @@ fn parse_interval_ms(s: &str) -> Option<u64> {
     }
 }
 
-pub fn run_mcp_server(workspace_dir: PathBuf) -> Result<(), ManagerError> {
-    let config = ManagerConfig {
-        workspace_dir: workspace_dir.clone(),
-        ..Default::default()
-    };
+pub fn run_mcp_server(config: ManagerConfig) -> Result<(), ManagerError> {
+    let workspace_dir = config.workspace_dir.clone();
     let manager = MemoryIndexManager::new(config)?;
     manager.sync()?;
 

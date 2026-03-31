@@ -2,6 +2,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+#[cfg(feature = "fastembed")]
+use std::sync::{Arc, Mutex};
+
 #[derive(Debug, thiserror::Error)]
 pub enum EmbeddingError {
     #[error("HTTP error: {0}")]
@@ -10,6 +13,10 @@ pub enum EmbeddingError {
     Api { status: u16, message: String },
     #[error("Missing API key: set {env_var}")]
     MissingApiKey { env_var: String },
+    #[error("Feature not enabled: rebuild with `{feature}`")]
+    FeatureDisabled { feature: String },
+    #[error("Embedding provider error: {message}")]
+    Provider { message: String },
 }
 
 /// Trait for pluggable embedding providers.
@@ -24,10 +31,12 @@ pub trait EmbeddingProvider: Send + Sync {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EmbeddingProviderKind {
     Openai,
     Gemini,
     Ollama,
+    Fastembed,
 }
 
 impl std::fmt::Display for EmbeddingProviderKind {
@@ -36,6 +45,7 @@ impl std::fmt::Display for EmbeddingProviderKind {
             EmbeddingProviderKind::Openai => write!(f, "openai"),
             EmbeddingProviderKind::Gemini => write!(f, "gemini"),
             EmbeddingProviderKind::Ollama => write!(f, "ollama"),
+            EmbeddingProviderKind::Fastembed => write!(f, "fastembed"),
         }
     }
 }
@@ -50,6 +60,12 @@ pub fn create_embedding_provider(
         EmbeddingProviderKind::Openai => Ok(Box::new(OpenAiProvider::new(api_key, model)?)),
         EmbeddingProviderKind::Gemini => Ok(Box::new(GeminiProvider::new(api_key, model)?)),
         EmbeddingProviderKind::Ollama => Ok(Box::new(OllamaProvider::new(api_key, model)?)),
+        #[cfg(feature = "fastembed")]
+        EmbeddingProviderKind::Fastembed => Ok(Box::new(FastembedProvider::new(api_key, model)?)),
+        #[cfg(not(feature = "fastembed"))]
+        EmbeddingProviderKind::Fastembed => Err(EmbeddingError::FeatureDisabled {
+            feature: "fastembed".to_string(),
+        }),
     }
 }
 
@@ -314,5 +330,129 @@ impl EmbeddingProvider for OllamaProvider {
 
     fn name(&self) -> &str {
         "ollama"
+    }
+}
+
+// --- FastEmbed Provider (serverless local embedding) ---
+
+#[cfg(feature = "fastembed")]
+pub struct FastembedProvider {
+    model: Arc<Mutex<fastembed::TextEmbedding>>,
+    dimensions: usize,
+}
+
+#[cfg(feature = "fastembed")]
+impl FastembedProvider {
+    pub fn new(_api_key: Option<String>, model: Option<String>) -> Result<Self, EmbeddingError> {
+        use fastembed::{InitOptions, TextEmbedding};
+
+        let model_name = model.unwrap_or_else(|| "BAAI/bge-small-en-v1.5".to_string());
+        let embedding_model = parse_fastembed_model(&model_name)?;
+        let dimensions = TextEmbedding::get_model_info(&embedding_model)
+            .map_err(|error| EmbeddingError::Provider {
+                message: error.to_string(),
+            })?
+            .dim;
+        let text_embedding = TextEmbedding::try_new(
+            InitOptions::new(embedding_model).with_show_download_progress(false),
+        )
+        .map_err(|error| EmbeddingError::Provider {
+            message: error.to_string(),
+        })?;
+
+        Ok(Self {
+            model: Arc::new(Mutex::new(text_embedding)),
+            dimensions,
+        })
+    }
+}
+
+#[cfg(feature = "fastembed")]
+fn parse_fastembed_model(model_name: &str) -> Result<fastembed::EmbeddingModel, EmbeddingError> {
+    use fastembed::EmbeddingModel;
+
+    let canonical = model_name.trim();
+    let alias = match canonical {
+        "BAAI/bge-small-en-v1.5" => Some(EmbeddingModel::BGESmallENV15),
+        "BAAI/bge-base-en-v1.5" => Some(EmbeddingModel::BGEBaseENV15),
+        "BAAI/bge-large-en-v1.5" => Some(EmbeddingModel::BGELargeENV15),
+        "sentence-transformers/all-MiniLM-L6-v2" => Some(EmbeddingModel::AllMiniLML6V2),
+        "sentence-transformers/all-MiniLM-L12-v2" => Some(EmbeddingModel::AllMiniLML12V2),
+        "nomic-ai/nomic-embed-text-v1" => Some(EmbeddingModel::NomicEmbedTextV1),
+        "nomic-ai/nomic-embed-text-v1.5" => Some(EmbeddingModel::NomicEmbedTextV15),
+        _ => None,
+    };
+
+    if let Some(model) = alias {
+        Ok(model)
+    } else {
+        canonical
+            .parse::<EmbeddingModel>()
+            .map_err(|message| EmbeddingError::Provider {
+                message: message.to_string(),
+            })
+    }
+}
+
+#[cfg(feature = "fastembed")]
+#[async_trait::async_trait]
+impl EmbeddingProvider for FastembedProvider {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f64>>, EmbeddingError> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let texts = texts.to_vec();
+        let model = Arc::clone(&self.model);
+        let embeddings = tokio::task::spawn_blocking(move || {
+            let model = model.lock().map_err(|error| EmbeddingError::Provider {
+                message: format!("fastembed model lock poisoned: {error}"),
+            })?;
+            model
+                .embed(texts, None)
+                .map_err(|error| EmbeddingError::Provider {
+                    message: error.to_string(),
+                })
+        })
+        .await
+        .map_err(|error| EmbeddingError::Provider {
+            message: format!("fastembed worker failed: {error}"),
+        })??;
+
+        Ok(embeddings
+            .into_iter()
+            .map(|embedding| embedding.into_iter().map(f64::from).collect())
+            .collect())
+    }
+
+    fn name(&self) -> &str {
+        "fastembed"
+    }
+
+    fn dimensions(&self) -> Option<usize> {
+        Some(self.dimensions)
+    }
+}
+
+#[cfg(all(test, feature = "fastembed"))]
+mod fastembed_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_fastembed_provider_embeds_text() {
+        let provider = FastembedProvider::new(None, None).unwrap();
+        assert_eq!(provider.name(), "fastembed");
+        assert_eq!(provider.dimensions(), Some(384));
+
+        let embeddings = provider
+            .embed(&[
+                "query: rust".to_string(),
+                "passage: systems programming".to_string(),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(embeddings.len(), 2);
+        assert_eq!(embeddings[0].len(), 384);
     }
 }

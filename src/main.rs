@@ -1,10 +1,16 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+use rustclaw::config::{RustclawConfig, load_config};
 use rustclaw::cron::service::{CronService, JobExecutor};
 use rustclaw::cron::store::CronJobStore;
 use rustclaw::cron::types::{CronJob, CronJobState, CronSchedule, JobRunResult, RunStatus};
+use rustclaw::daemon::{
+    DaemonConfig as ServiceConfig, install as install_daemon, restart as restart_daemon,
+    status as daemon_status, uninstall as uninstall_daemon,
+};
 use rustclaw::embedding::{EmbeddingProviderKind, create_embedding_provider};
+use rustclaw::export::{default_db_path, export_index, import_index};
 use rustclaw::manager::{ManagerConfig, MemoryIndexManager};
 use rustclaw::mcp::run_mcp_server;
 use rustclaw::watcher::MemoryWatcher;
@@ -55,8 +61,8 @@ enum Commands {
         embed: bool,
 
         /// Embedding provider
-        #[arg(long, value_enum, default_value = "openai")]
-        provider: EmbeddingProviderKind,
+        #[arg(long, value_enum)]
+        provider: Option<EmbeddingProviderKind>,
 
         /// Embedding model override
         #[arg(long)]
@@ -66,8 +72,8 @@ enum Commands {
     /// Generate embeddings for all chunks
     Embed {
         /// Embedding provider
-        #[arg(long, value_enum, default_value = "openai")]
-        provider: EmbeddingProviderKind,
+        #[arg(long, value_enum)]
+        provider: Option<EmbeddingProviderKind>,
 
         /// Embedding model override
         #[arg(long)]
@@ -76,6 +82,20 @@ enum Commands {
         /// Batch size for API calls
         #[arg(long, default_value = "64")]
         batch_size: usize,
+    },
+
+    /// Export the current index to a JSON backup
+    Export {
+        /// Output JSON file path
+        #[arg(long)]
+        output: PathBuf,
+    },
+
+    /// Import a JSON backup into the current index
+    Import {
+        /// Input JSON file path
+        #[arg(long)]
+        input: PathBuf,
     },
 
     /// Watch for file changes and auto-sync
@@ -95,6 +115,18 @@ enum Commands {
     Cron {
         #[command(subcommand)]
         action: CronAction,
+    },
+
+    /// Install rustclaw as a background OS service
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+
+    /// Manage the persisted HNSW vector index
+    Hnsw {
+        #[command(subcommand)]
+        action: HnswAction,
     },
 }
 
@@ -120,6 +152,24 @@ enum CronAction {
     Run,
 }
 
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Install and start the daemon for this workspace
+    Install,
+    /// Remove the daemon for this workspace
+    Uninstall,
+    /// Show daemon install/running status
+    Status,
+    /// Restart the daemon for this workspace
+    Restart,
+}
+
+#[derive(Subcommand)]
+enum HnswAction {
+    /// Build or rebuild the persisted HNSW index from stored embeddings
+    Build,
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -137,22 +187,12 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let config = ManagerConfig {
-        db_path: cli.db,
-        workspace_dir: workspace_dir.clone(),
-        ..Default::default()
-    };
-
-    let manager = match MemoryIndexManager::new(config) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    };
+    let file_config = load_config(&workspace_dir);
+    let manager_config = build_manager_config(&workspace_dir, cli.db.clone(), file_config.as_ref());
 
     match cli.command {
         Commands::Status => {
+            let manager = open_manager_or_exit(&manager_config);
             if let Err(e) = manager.sync() {
                 eprintln!("Sync failed: {e}");
                 std::process::exit(1);
@@ -172,6 +212,7 @@ async fn main() {
         }
 
         Commands::Sync => {
+            let manager = open_manager_or_exit(&manager_config);
             println!("syncing {}...", workspace_dir.display());
             match manager.sync() {
                 Ok(r) => println!("{r}"),
@@ -190,12 +231,15 @@ async fn main() {
             provider,
             model,
         } => {
+            let manager = open_manager_or_exit(&manager_config);
             if let Err(e) = manager.sync() {
                 eprintln!("Sync failed: {e}");
                 std::process::exit(1);
             }
 
             let results = if embed {
+                let (provider, model) =
+                    resolve_embedding_settings(file_config.as_ref(), provider, model);
                 let client = match create_embedding_provider(provider, None, model) {
                     Ok(c) => c,
                     Err(e) => {
@@ -245,11 +289,14 @@ async fn main() {
             model,
             batch_size,
         } => {
+            let manager = open_manager_or_exit(&manager_config);
             if let Err(e) = manager.sync() {
                 eprintln!("Sync failed: {e}");
                 std::process::exit(1);
             }
 
+            let (provider, model) =
+                resolve_embedding_settings(file_config.as_ref(), provider, model);
             let client = match create_embedding_provider(provider, None, model) {
                 Ok(c) => c,
                 Err(e) => {
@@ -268,7 +315,52 @@ async fn main() {
             }
         }
 
+        Commands::Export { output } => {
+            let manager = open_manager_or_exit(&manager_config);
+            if let Err(e) = manager.sync() {
+                eprintln!("Sync failed: {e}");
+                std::process::exit(1);
+            }
+
+            let db_path = default_db_path(&manager_config);
+            match export_index(&db_path, &workspace_dir, &output) {
+                Ok(export) => {
+                    println!(
+                        "exported {} files, {} chunks, {} embeddings to {}",
+                        export.files.len(),
+                        export.chunks.len(),
+                        export.embeddings.len(),
+                        output.display(),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Export failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::Import { input } => {
+            let db_path = default_db_path(&manager_config);
+            match import_index(&db_path, &input) {
+                Ok(summary) => {
+                    println!(
+                        "imported {} files, {} chunks, {} embeddings from {}",
+                        summary.files,
+                        summary.chunks,
+                        summary.embeddings,
+                        input.display(),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Import failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
         Commands::Watch => {
+            let manager = open_manager_or_exit(&manager_config);
             if let Err(e) = manager.sync() {
                 eprintln!("Initial sync failed: {e}");
                 std::process::exit(1);
@@ -291,10 +383,7 @@ async fn main() {
                 println!("change detected: {}", paths.join(", "));
 
                 // Re-sync using a new manager (watcher runs in a separate thread)
-                let config = ManagerConfig {
-                    workspace_dir: workspace_dir.clone(),
-                    ..Default::default()
-                };
+                let config = manager_config.clone();
                 if let Ok(mgr) = MemoryIndexManager::new(config) {
                     match mgr.sync() {
                         Ok(r) => println!("  {r}"),
@@ -315,14 +404,14 @@ async fn main() {
         }
 
         Commands::Mcp => {
-            if let Err(e) = run_mcp_server(workspace_dir) {
+            if let Err(e) = run_mcp_server(manager_config) {
                 eprintln!("MCP server error: {e}");
                 std::process::exit(1);
             }
         }
 
         Commands::Serve { port } => {
-            if let Err(e) = run_web_server(workspace_dir, port).await {
+            if let Err(e) = run_web_server(manager_config, port).await {
                 eprintln!("Web server error: {e}");
                 std::process::exit(1);
             }
@@ -413,6 +502,83 @@ async fn main() {
                 }
             }
         }
+
+        Commands::Daemon { action } => {
+            let daemon_config = build_daemon_config(&workspace_dir, manager_config.db_path.clone());
+
+            match action {
+                DaemonAction::Install => match install_daemon(&daemon_config) {
+                    Ok(path) => {
+                        println!("installed daemon {}", daemon_config.service_name);
+                        println!("  file: {}", path.display());
+                    }
+                    Err(e) => {
+                        eprintln!("Daemon install failed: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                DaemonAction::Uninstall => match uninstall_daemon(&daemon_config) {
+                    Ok(path) => {
+                        println!("removed daemon {}", daemon_config.service_name);
+                        println!("  file: {}", path.display());
+                    }
+                    Err(e) => {
+                        eprintln!("Daemon uninstall failed: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                DaemonAction::Status => match daemon_status(&daemon_config) {
+                    Ok(status) => {
+                        println!("platform:  {}", status.platform);
+                        println!("service:   {}", status.service_name);
+                        println!("file:      {}", status.service_file.display());
+                        println!("installed: {}", status.installed);
+                        println!("running:   {}", status.running);
+                    }
+                    Err(e) => {
+                        eprintln!("Daemon status failed: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                DaemonAction::Restart => match restart_daemon(&daemon_config) {
+                    Ok(()) => println!("restarted daemon {}", daemon_config.service_name),
+                    Err(e) => {
+                        eprintln!("Daemon restart failed: {e}");
+                        std::process::exit(1);
+                    }
+                },
+            }
+        }
+
+        Commands::Hnsw { action } => match action {
+            HnswAction::Build => {
+                let manager = open_manager_or_exit(&manager_config);
+                if let Err(e) = manager.sync() {
+                    eprintln!("Sync failed: {e}");
+                    std::process::exit(1);
+                }
+
+                match manager.build_hnsw_index() {
+                    Ok(count) => {
+                        let chunks = manager
+                            .status()
+                            .map(|status| status.chunks)
+                            .unwrap_or(count);
+                        println!("built HNSW index for {count} embedded chunks");
+                        if chunks > count {
+                            println!(
+                                "note: {} chunks do not have embeddings yet and were skipped",
+                                chunks - count
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("HNSW build failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
     }
 }
 
@@ -448,5 +614,54 @@ fn parse_interval(s: &str) -> Option<u64> {
         "h" => Some(n * 3_600_000),
         "d" => Some(n * 86_400_000),
         _ => None,
+    }
+}
+
+fn build_manager_config(
+    workspace_dir: &std::path::Path,
+    db_path: Option<PathBuf>,
+    file_config: Option<&RustclawConfig>,
+) -> ManagerConfig {
+    let mut manager_config = ManagerConfig {
+        db_path,
+        workspace_dir: workspace_dir.to_path_buf(),
+        ..Default::default()
+    };
+
+    if let Some(file_config) = file_config {
+        file_config.apply_to_manager_config(&mut manager_config, workspace_dir);
+    }
+
+    manager_config
+}
+
+fn build_daemon_config(workspace_dir: &std::path::Path, db_path: Option<PathBuf>) -> ServiceConfig {
+    let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rustclaw"));
+    ServiceConfig::new(executable, workspace_dir.to_path_buf(), db_path)
+}
+
+fn resolve_embedding_settings(
+    file_config: Option<&RustclawConfig>,
+    cli_provider: Option<EmbeddingProviderKind>,
+    cli_model: Option<String>,
+) -> (EmbeddingProviderKind, Option<String>) {
+    let config_provider = file_config.and_then(RustclawConfig::embedding_provider);
+    let config_model = file_config.and_then(RustclawConfig::embedding_model);
+
+    (
+        cli_provider
+            .or(config_provider)
+            .unwrap_or(EmbeddingProviderKind::Openai),
+        cli_model.or(config_model),
+    )
+}
+
+fn open_manager_or_exit(config: &ManagerConfig) -> MemoryIndexManager {
+    match MemoryIndexManager::new(config.clone()) {
+        Ok(manager) => manager,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
     }
 }

@@ -19,6 +19,8 @@ pub struct HnswIndex {
     entry_point: Option<usize>,
 }
 
+pub type SerializedHnswNode = (usize, Vec<usize>);
+
 #[derive(Clone)]
 struct ScoredNode {
     id: usize,
@@ -239,6 +241,67 @@ impl HnswIndex {
         }
         index
     }
+
+    /// Serialize graph structure as node IDs and neighbor node IDs.
+    pub fn serialize(&self) -> Vec<SerializedHnswNode> {
+        self.nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.id,
+                    node.neighbors
+                        .iter()
+                        .map(|&neighbor_idx| self.nodes[neighbor_idx].id)
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Reconstruct a persisted graph using the stored embeddings for each node ID.
+    pub fn deserialize(
+        nodes: &[SerializedHnswNode],
+        embeddings: &[(usize, Vec<f64>)],
+    ) -> Option<Self> {
+        if nodes.is_empty() {
+            return Some(Self::new());
+        }
+
+        let embedding_map: std::collections::HashMap<usize, Vec<f64>> =
+            embeddings.iter().cloned().collect();
+        if embedding_map.len() != nodes.len() {
+            return None;
+        }
+
+        let mut id_to_index = std::collections::HashMap::with_capacity(nodes.len());
+        let mut rebuilt_nodes = Vec::with_capacity(nodes.len());
+
+        for (index, (id, _)) in nodes.iter().enumerate() {
+            let embedding = embedding_map.get(id)?.clone();
+            id_to_index.insert(*id, index);
+            rebuilt_nodes.push(HnswNode {
+                id: *id,
+                embedding,
+                neighbors: Vec::new(),
+            });
+        }
+
+        for (index, (_, neighbor_ids)) in nodes.iter().enumerate() {
+            let mut neighbors = Vec::with_capacity(neighbor_ids.len());
+            for neighbor_id in neighbor_ids {
+                let neighbor_index = *id_to_index.get(neighbor_id)?;
+                if neighbor_index != index && !neighbors.contains(&neighbor_index) {
+                    neighbors.push(neighbor_index);
+                }
+            }
+            rebuilt_nodes[index].neighbors = neighbors;
+        }
+
+        Some(Self {
+            nodes: rebuilt_nodes,
+            entry_point: Some(0),
+        })
+    }
 }
 
 impl Default for HnswIndex {
@@ -318,5 +381,33 @@ mod tests {
             (0..10).map(|i| (i, random_vec(32, i as u64 + 1))).collect();
         let index = HnswIndex::build_from(&vectors);
         assert_eq!(index.len(), 10);
+    }
+
+    #[test]
+    fn test_serialize_deserialize_roundtrip() {
+        let vectors: Vec<(usize, Vec<f64>)> = (0..12)
+            .map(|i| (100 + i, random_vec(24, i as u64 + 7)))
+            .collect();
+        let index = HnswIndex::build_from(&vectors);
+        let serialized = index.serialize();
+
+        let restored = HnswIndex::deserialize(&serialized, &vectors).unwrap();
+        assert_eq!(restored.len(), index.len());
+
+        let query = &vectors[5].1;
+        let original = index.search(query, 3);
+        let roundtrip = restored.search(query, 3);
+        assert_eq!(original, roundtrip);
+    }
+
+    #[test]
+    fn test_deserialize_rejects_embedding_mismatch() {
+        let vectors: Vec<(usize, Vec<f64>)> =
+            (0..4).map(|i| (i, random_vec(16, i as u64 + 1))).collect();
+        let index = HnswIndex::build_from(&vectors);
+        let serialized = index.serialize();
+
+        let mismatched: Vec<(usize, Vec<f64>)> = vectors.into_iter().skip(1).collect();
+        assert!(HnswIndex::deserialize(&serialized, &mismatched).is_none());
     }
 }

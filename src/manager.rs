@@ -1,24 +1,25 @@
 use std::path::PathBuf;
 
+use rayon::prelude::*;
+
 use crate::embedding::{EmbeddingError, EmbeddingProvider};
 use crate::hnsw::HnswIndex;
 use crate::hybrid::{MergeHybridParams, bm25_rank_to_score, build_fts_query, merge_hybrid_results};
-use crate::internal::{build_file_entry, chunk_markdown, list_memory_files};
+use crate::internal::{build_file_entry, chunk_markdown, list_memory_files, remap_chunk_lines};
 use crate::mmr::MmrConfig;
 use crate::sessions::{build_session_entry, list_session_files};
 use crate::simd::cosine_similarity_simd;
-use crate::sqlite::{MemoryDb, StorageError};
+use crate::sqlite::{MemoryDb, StorageBackend, StorageError};
 use crate::temporal_decay::TemporalDecayConfig;
 use crate::types::{
-    ChunkingConfig, HybridKeywordResult, HybridVectorResult, MemorySearchResult, MemorySource,
+    ChunkingConfig, HybridKeywordResult, HybridVectorResult, MemoryChunk, MemoryFileEntry,
+    MemorySearchResult, MemorySource,
 };
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManagerError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("SQLite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
     #[error("Storage error: {0}")]
     Storage(#[from] StorageError),
     #[error("JSON error: {0}")]
@@ -30,7 +31,7 @@ pub enum ManagerError {
 /// Core memory index manager. Orchestrates file sync, chunking, embedding,
 /// and hybrid search across memory files and sessions.
 pub struct MemoryIndexManager {
-    db: MemoryDb,
+    db: Box<dyn StorageBackend + Send>,
     workspace_dir: PathBuf,
     extra_paths: Vec<PathBuf>,
     session_dir: Option<PathBuf>,
@@ -42,6 +43,7 @@ pub struct MemoryIndexManager {
     hnsw: std::cell::RefCell<Option<HnswIndex>>,
 }
 
+#[derive(Debug, Clone)]
 pub struct ManagerConfig {
     pub db_path: Option<PathBuf>,
     pub workspace_dir: PathBuf,
@@ -73,14 +75,23 @@ impl Default for ManagerConfig {
 impl MemoryIndexManager {
     pub fn new(config: ManagerConfig) -> Result<Self, ManagerError> {
         let db = match &config.db_path {
-            Some(path) => MemoryDb::open(path)?,
+            Some(path) => Box::new(MemoryDb::open(path).map_err(StorageError::from)?)
+                as Box<dyn StorageBackend + Send>,
             None => {
                 let default_path = config.workspace_dir.join(".memory.db");
-                MemoryDb::open(&default_path)?
+                Box::new(MemoryDb::open(&default_path).map_err(StorageError::from)?)
+                    as Box<dyn StorageBackend + Send>
             }
         };
 
-        Ok(Self {
+        Self::with_storage(config, db)
+    }
+
+    pub fn with_storage(
+        config: ManagerConfig,
+        db: Box<dyn StorageBackend + Send>,
+    ) -> Result<Self, ManagerError> {
+        let manager = Self {
             db,
             workspace_dir: config.workspace_dir,
             extra_paths: config.extra_paths,
@@ -91,23 +102,21 @@ impl MemoryIndexManager {
             mmr: config.mmr,
             temporal_decay: config.temporal_decay,
             hnsw: std::cell::RefCell::new(None),
-        })
+        };
+
+        manager.load_persisted_hnsw()?;
+        Ok(manager)
     }
 
     #[cfg(test)]
     pub fn new_in_memory(workspace_dir: PathBuf) -> Result<Self, ManagerError> {
-        Ok(Self {
-            db: MemoryDb::open_in_memory()?,
-            workspace_dir,
-            extra_paths: vec![],
-            session_dir: None,
-            chunking: ChunkingConfig::default(),
-            vector_weight: 0.7,
-            text_weight: 0.3,
-            mmr: MmrConfig::default(),
-            temporal_decay: TemporalDecayConfig::default(),
-            hnsw: std::cell::RefCell::new(None),
-        })
+        Self::with_storage(
+            ManagerConfig {
+                workspace_dir,
+                ..Default::default()
+            },
+            Box::new(MemoryDb::open_in_memory().map_err(StorageError::from)?),
+        )
     }
 
     /// Sync filesystem state into the database
@@ -123,11 +132,10 @@ impl MemoryIndexManager {
         // Track which paths we've seen from filesystem
         let mut seen_paths = std::collections::HashSet::new();
 
-        for file_path in &files {
-            let entry = match build_file_entry(file_path, &self.workspace_dir)? {
-                Some(e) => e,
-                None => continue,
-            };
+        let file_entries = collect_file_entries_in_parallel(&files, &self.workspace_dir)?;
+        let mut pending_files = Vec::new();
+
+        for (file_path, entry) in file_entries {
             seen_paths.insert(entry.path.clone());
 
             let existing_hash = self.db.get_file_hash(&entry.path)?;
@@ -137,31 +145,40 @@ impl MemoryIndexManager {
                 continue;
             }
 
-            // File is new or changed
-            if existing_hash.is_some() {
-                self.db.delete_file(&entry.path)?;
+            pending_files.push(PendingFileWrite {
+                file_path,
+                entry,
+                existed: existing_hash.is_some(),
+            });
+        }
+
+        let chunked_files = chunk_memory_files_in_parallel(&pending_files, &self.chunking)?;
+        for pending in chunked_files {
+            if pending.existed {
+                self.db.delete_file(&pending.entry.path)?;
                 updated += 1;
             } else {
                 added += 1;
             }
 
+            self.db.upsert_file(
+                &pending.entry.path,
+                &pending.entry.hash,
+                pending.entry.mtime_ms,
+                pending.entry.size,
+            )?;
             self.db
-                .upsert_file(&entry.path, &entry.hash, entry.mtime_ms, entry.size)?;
-
-            // Read content and chunk
-            let content = std::fs::read_to_string(file_path)?;
-            let chunks = chunk_markdown(&content, &self.chunking);
-            self.db.insert_chunks(&entry.path, &chunks)?;
+                .insert_chunks(&pending.entry.path, &pending.chunks)?;
         }
 
         // Sync session files (JSONL)
         if let Some(session_dir) = &self.session_dir {
             let session_files = list_session_files(session_dir);
-            for file_path in &session_files {
-                let entry = match build_file_entry(file_path, &self.workspace_dir)? {
-                    Some(e) => e,
-                    None => continue,
-                };
+            let session_entries =
+                collect_file_entries_in_parallel(&session_files, &self.workspace_dir)?;
+            let mut pending_sessions = Vec::new();
+
+            for (file_path, entry) in session_entries {
                 let session_path = format!("sessions/{}", entry.path);
                 seen_paths.insert(session_path.clone());
 
@@ -171,22 +188,35 @@ impl MemoryIndexManager {
                     continue;
                 }
 
-                if existing_hash.is_some() {
-                    self.db.delete_file(&session_path)?;
+                pending_sessions.push(PendingSessionWrite {
+                    file_path,
+                    session_path,
+                    entry,
+                    existed: existing_hash.is_some(),
+                    chunks: Vec::new(),
+                });
+            }
+
+            let chunked_sessions =
+                chunk_session_files_in_parallel(&pending_sessions, &self.chunking)?;
+            for pending in chunked_sessions {
+                if pending.existed {
+                    self.db.delete_file(&pending.session_path)?;
                     updated += 1;
                 } else {
                     added += 1;
                 }
 
-                self.db
-                    .upsert_file(&session_path, &entry.hash, entry.mtime_ms, entry.size)?;
+                self.db.upsert_file(
+                    &pending.session_path,
+                    &pending.entry.hash,
+                    pending.entry.mtime_ms,
+                    pending.entry.size,
+                )?;
 
-                let content = std::fs::read_to_string(file_path)?;
-                let session = build_session_entry(&content);
-                if !session.text.is_empty() {
-                    let mut chunks = chunk_markdown(&session.text, &self.chunking);
-                    crate::internal::remap_chunk_lines(&mut chunks, Some(&session.line_map));
-                    self.db.insert_chunks(&session_path, &chunks)?;
+                if !pending.chunks.is_empty() {
+                    self.db
+                        .insert_chunks(&pending.session_path, &pending.chunks)?;
                 }
             }
         }
@@ -201,7 +231,7 @@ impl MemoryIndexManager {
 
         // Invalidate HNSW index on changes
         if added > 0 || updated > 0 || removed > 0 {
-            *self.hnsw.borrow_mut() = None;
+            self.invalidate_hnsw()?;
         }
 
         Ok(SyncResult {
@@ -229,7 +259,13 @@ impl MemoryIndexManager {
             .collect();
 
         let count = vectors.len();
+        if count == 0 {
+            self.invalidate_hnsw()?;
+            return Ok(0);
+        }
+
         let index = HnswIndex::build_from(&vectors);
+        self.db.save_hnsw_graph(&index.serialize())?;
         *self.hnsw.borrow_mut() = Some(index);
         Ok(count)
     }
@@ -247,11 +283,17 @@ impl MemoryIndexManager {
 
         let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
         let embeddings = embed_fn(&texts);
+        let mut updated = 0usize;
 
         for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
             if !embedding.is_empty() {
                 self.db.update_embedding(chunk.id, embedding)?;
+                updated += 1;
             }
+        }
+
+        if updated > 0 {
+            self.invalidate_hnsw()?;
         }
 
         Ok(chunks.len())
@@ -280,6 +322,10 @@ impl MemoryIndexManager {
                     total += 1;
                 }
             }
+        }
+
+        if total > 0 {
+            self.invalidate_hnsw()?;
         }
 
         Ok(total)
@@ -412,6 +458,131 @@ impl MemoryIndexManager {
             workspace_dir: self.workspace_dir.to_string_lossy().into_owned(),
         })
     }
+
+    fn load_persisted_hnsw(&self) -> Result<bool, ManagerError> {
+        let serialized = self.db.load_hnsw_graph()?;
+        if serialized.is_empty() {
+            *self.hnsw.borrow_mut() = None;
+            return Ok(false);
+        }
+
+        let rows = self.db.get_all_embeddings()?;
+        let embeddings: Vec<(usize, Vec<f64>)> = rows
+            .iter()
+            .filter_map(|row| {
+                let embedding: Vec<f64> = serde_json::from_str(&row.embedding_json).ok()?;
+                if embedding.is_empty() {
+                    return None;
+                }
+                Some((row.id as usize, embedding))
+            })
+            .collect();
+
+        if let Some(index) = HnswIndex::deserialize(&serialized, &embeddings) {
+            *self.hnsw.borrow_mut() = Some(index);
+            Ok(true)
+        } else {
+            self.db.clear_hnsw_graph()?;
+            *self.hnsw.borrow_mut() = None;
+            Ok(false)
+        }
+    }
+
+    fn invalidate_hnsw(&self) -> Result<(), ManagerError> {
+        self.db.clear_hnsw_graph()?;
+        *self.hnsw.borrow_mut() = None;
+        Ok(())
+    }
+}
+
+struct PendingFileWrite {
+    file_path: PathBuf,
+    entry: MemoryFileEntry,
+    existed: bool,
+}
+
+struct PendingChunkedFileWrite {
+    entry: MemoryFileEntry,
+    chunks: Vec<MemoryChunk>,
+    existed: bool,
+}
+
+struct PendingSessionWrite {
+    file_path: PathBuf,
+    session_path: String,
+    entry: MemoryFileEntry,
+    existed: bool,
+    chunks: Vec<MemoryChunk>,
+}
+
+fn collect_file_entries_in_parallel(
+    files: &[PathBuf],
+    workspace_dir: &std::path::Path,
+) -> Result<Vec<(PathBuf, MemoryFileEntry)>, std::io::Error> {
+    let prepared: Vec<std::io::Result<Option<(PathBuf, MemoryFileEntry)>>> = files
+        .par_iter()
+        .map(|file_path| {
+            build_file_entry(file_path, workspace_dir)
+                .map(|entry| entry.map(|entry| (file_path.clone(), entry)))
+        })
+        .collect();
+
+    let mut entries = Vec::with_capacity(prepared.len());
+    for result in prepared {
+        if let Some(entry) = result? {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+fn chunk_memory_files_in_parallel(
+    files: &[PendingFileWrite],
+    chunking: &ChunkingConfig,
+) -> Result<Vec<PendingChunkedFileWrite>, std::io::Error> {
+    let prepared: Vec<std::io::Result<PendingChunkedFileWrite>> = files
+        .par_iter()
+        .map(|pending| {
+            let content = std::fs::read_to_string(&pending.file_path)?;
+            let chunks = chunk_markdown(&content, chunking);
+            Ok(PendingChunkedFileWrite {
+                entry: pending.entry.clone(),
+                chunks,
+                existed: pending.existed,
+            })
+        })
+        .collect();
+
+    prepared.into_iter().collect()
+}
+
+fn chunk_session_files_in_parallel(
+    files: &[PendingSessionWrite],
+    chunking: &ChunkingConfig,
+) -> Result<Vec<PendingSessionWrite>, std::io::Error> {
+    let prepared: Vec<std::io::Result<PendingSessionWrite>> = files
+        .par_iter()
+        .map(|pending| {
+            let content = std::fs::read_to_string(&pending.file_path)?;
+            let session = build_session_entry(&content);
+            let mut chunks = if session.text.is_empty() {
+                Vec::new()
+            } else {
+                chunk_markdown(&session.text, chunking)
+            };
+            remap_chunk_lines(&mut chunks, Some(&session.line_map));
+
+            Ok(PendingSessionWrite {
+                file_path: pending.file_path.clone(),
+                session_path: pending.session_path.clone(),
+                entry: pending.entry.clone(),
+                existed: pending.existed,
+                chunks,
+            })
+        })
+        .collect();
+
+    prepared.into_iter().collect()
 }
 
 /// Multi-workspace search: search across multiple workspace indexes and merge results.
@@ -471,6 +642,14 @@ pub struct ManagerStatus {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn file_backed_config(workspace: &std::path::Path) -> ManagerConfig {
+        ManagerConfig {
+            db_path: Some(workspace.join(".memory.db")),
+            workspace_dir: workspace.to_path_buf(),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn test_sync_and_search() {
@@ -574,5 +753,97 @@ mod tests {
         assert!(!results.is_empty());
         // Score = vector_weight(0.7) * cosine_sim(1.0) + text_weight(0.3) * text_score
         assert!(results[0].score > 0.5);
+    }
+
+    #[test]
+    fn test_hnsw_persists_across_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        fs::write(
+            workspace.join("MEMORY.md"),
+            "test content for persisted hnsw search",
+        )
+        .unwrap();
+
+        let config = file_backed_config(workspace);
+        let manager = MemoryIndexManager::new(config.clone()).unwrap();
+        manager.sync().unwrap();
+        manager
+            .store_embeddings(|texts| texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+            .unwrap();
+        assert_eq!(manager.build_hnsw_index().unwrap(), 1);
+        assert!(manager.hnsw.borrow().is_some());
+
+        let reopened = MemoryIndexManager::new(config).unwrap();
+        assert!(reopened.hnsw.borrow().is_some());
+
+        let results = reopened
+            .search("persisted", Some(&[0.1, 0.2, 0.3]), 10, 0.0)
+            .unwrap();
+        assert!(!results.is_empty());
+        assert!(results[0].snippet.contains("persisted hnsw"));
+    }
+
+    #[test]
+    fn test_sync_invalidates_persisted_hnsw() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        fs::write(workspace.join("MEMORY.md"), "v1").unwrap();
+
+        let config = file_backed_config(workspace);
+        let manager = MemoryIndexManager::new(config.clone()).unwrap();
+        manager.sync().unwrap();
+        manager
+            .store_embeddings(|texts| texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+            .unwrap();
+        assert_eq!(manager.build_hnsw_index().unwrap(), 1);
+
+        let db = MemoryDb::open(&workspace.join(".memory.db")).unwrap();
+        assert_eq!(db.load_hnsw_graph().unwrap().len(), 1);
+
+        fs::write(workspace.join("MEMORY.md"), "v2 changed").unwrap();
+        let result = manager.sync().unwrap();
+        assert_eq!(result.updated, 1);
+        assert!(manager.hnsw.borrow().is_none());
+
+        let db = MemoryDb::open(&workspace.join(".memory.db")).unwrap();
+        assert!(db.load_hnsw_graph().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_embedding_updates_invalidate_persisted_hnsw() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        fs::write(workspace.join("MEMORY.md"), "first version").unwrap();
+
+        let config = file_backed_config(workspace);
+        let manager = MemoryIndexManager::new(config.clone()).unwrap();
+        manager.sync().unwrap();
+        manager
+            .store_embeddings(|texts| texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+            .unwrap();
+        manager.build_hnsw_index().unwrap();
+
+        fs::write(workspace.join("MEMORY.md"), "second version with new chunk").unwrap();
+        manager.sync().unwrap();
+        assert!(
+            MemoryDb::open(&workspace.join(".memory.db"))
+                .unwrap()
+                .load_hnsw_graph()
+                .unwrap()
+                .is_empty()
+        );
+
+        manager
+            .store_embeddings(|texts| texts.iter().map(|_| vec![0.9, 0.8, 0.7]).collect())
+            .unwrap();
+        assert!(manager.hnsw.borrow().is_none());
+        assert!(
+            MemoryDb::open(&workspace.join(".memory.db"))
+                .unwrap()
+                .load_hnsw_graph()
+                .unwrap()
+                .is_empty()
+        );
     }
 }

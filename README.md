@@ -18,6 +18,7 @@ Rust port of [OpenClaw](https://github.com/openclaw/openclaw)'s memory system.
 - **MCP Server** - Model Context Protocol for Claude Code integration
 - **Web UI** - Browser-based search with live results
 - **File Watcher** - Auto-sync on memory file changes via `notify`
+- **Daemon Service** - Install watch mode as a systemd user service or launchd agent
 - **SQLite + FTS5** - Persistent storage (pluggable via `StorageBackend` trait)
 
 ## Install
@@ -46,9 +47,46 @@ rustclaw -w /path/to/workspace search "rust programming" --embed
 # Generate embeddings for all chunks
 rustclaw -w /path/to/workspace embed --provider openai
 
+# Build the persisted HNSW index after embeddings are ready
+rustclaw -w /path/to/workspace hnsw build
+
+# Export the index for backup or migration
+rustclaw -w /path/to/workspace export --output backup.json
+
+# Import a backup into the index
+rustclaw -w /path/to/workspace import --input backup.json
+
+# Generate embeddings locally without OpenAI/Ollama
+cargo run --features fastembed -- -w /path/to/workspace embed --provider fastembed
+
 # Watch for file changes
 rustclaw -w /path/to/workspace watch
 ```
+
+### Workspace Config
+
+Create `/path/to/workspace/.rustclaw.toml` to avoid repeating common options:
+
+```toml
+[workspace]
+extra_paths = ["../shared-memory"]
+session_dir = "./sessions"
+
+[search]
+vector_weight = 0.7
+text_weight = 0.3
+mmr_enabled = false
+mmr_lambda = 0.7
+temporal_decay_enabled = false
+half_life_days = 30
+
+[embedding]
+provider = "ollama"
+model = "nomic-embed-text"
+```
+
+CLI flags still take precedence over config file values.
+For serverless local embeddings, set `provider = "fastembed"` and run with `--features fastembed`.
 
 ### Web UI
 
@@ -102,6 +140,38 @@ rustclaw -w /path/to/workspace cron run
 
 Features: exponential backoff on errors, one-shot auto-disable, SHA-256 deterministic stagger, JSON persistence.
 
+### HNSW Index
+
+```bash
+# Typical vector-search flow
+rustclaw -w /path/to/workspace sync
+rustclaw -w /path/to/workspace embed --provider ollama
+rustclaw -w /path/to/workspace hnsw build
+```
+
+`hnsw build` rebuilds the persisted ANN graph from currently embedded chunks only.
+If some chunks still have no embeddings, the command reports how many were skipped.
+
+### Daemon Service
+
+```bash
+# Install watch mode as a background service
+rustclaw -w /path/to/workspace daemon install
+
+# Check whether the service is installed and running
+rustclaw -w /path/to/workspace daemon status
+
+# Restart the background service
+rustclaw -w /path/to/workspace daemon restart
+
+# Remove the service
+rustclaw -w /path/to/workspace daemon uninstall
+```
+
+Linux installs a user-level `systemd` unit under `~/.config/systemd/user/`.
+macOS installs a `launchd` agent under `~/Library/LaunchAgents/`.
+Windows currently returns an unsupported-platform error.
+
 ## Plugin System
 
 ### Custom Embedding Provider
@@ -137,6 +207,7 @@ impl StorageBackend for MyStorage {
 
 ```
 rustclaw
+├── daemon/            # systemd / launchd service manager
 ├── internal.rs        # Markdown chunking, hashing, file scanning
 ├── sqlite.rs          # SQLite storage + FTS5 (StorageBackend trait)
 ├── hnsw.rs            # HNSW approximate nearest neighbor index

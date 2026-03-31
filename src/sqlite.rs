@@ -5,7 +5,7 @@ use crate::types::MemoryChunk;
 
 /// Trait for pluggable storage backends.
 /// Implement this trait to use a custom storage engine (e.g., PostgreSQL, DuckDB).
-pub trait StorageBackend {
+pub trait StorageBackend: Send {
     fn upsert_file(
         &self,
         path: &str,
@@ -23,6 +23,12 @@ pub trait StorageBackend {
     fn file_count(&self) -> Result<usize, StorageError>;
     fn chunk_count(&self) -> Result<usize, StorageError>;
     fn all_file_paths(&self) -> Result<Vec<String>, StorageError>;
+    fn save_hnsw_graph(
+        &self,
+        nodes: &[crate::hnsw::SerializedHnswNode],
+    ) -> Result<(), StorageError>;
+    fn load_hnsw_graph(&self) -> Result<Vec<crate::hnsw::SerializedHnswNode>, StorageError>;
+    fn clear_hnsw_graph(&self) -> Result<(), StorageError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +37,8 @@ pub enum StorageError {
     Sqlite(#[from] rusqlite::Error),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 pub struct MemoryDb {
@@ -75,6 +83,14 @@ impl MemoryDb {
 
             CREATE INDEX IF NOT EXISTS idx_chunks_file_path ON chunks(file_path);
             CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(hash);
+
+            CREATE TABLE IF NOT EXISTS hnsw_nodes (
+                position INTEGER NOT NULL,
+                id INTEGER PRIMARY KEY,
+                neighbors TEXT NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_hnsw_nodes_position ON hnsw_nodes(position);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                 text,
@@ -181,7 +197,8 @@ impl MemoryDb {
     pub fn get_all_embeddings(&self) -> SqlResult<Vec<EmbeddingRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, file_path, start_line, end_line, text, hash, embedding
-             FROM chunks WHERE embedding IS NOT NULL",
+             FROM chunks WHERE embedding IS NOT NULL
+             ORDER BY id",
         )?;
 
         let results = stmt
@@ -204,7 +221,8 @@ impl MemoryDb {
     pub fn get_chunks_without_embedding(&self) -> SqlResult<Vec<ChunkRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, file_path, start_line, end_line, text, hash
-             FROM chunks WHERE embedding IS NULL",
+             FROM chunks WHERE embedding IS NULL
+             ORDER BY id",
         )?;
 
         let results = stmt
@@ -221,6 +239,117 @@ impl MemoryDb {
             .collect::<SqlResult<Vec<_>>>()?;
 
         Ok(results)
+    }
+
+    pub fn get_all_files(&self) -> SqlResult<Vec<FileRow>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, hash, mtime_ms, size FROM files ORDER BY path")?;
+
+        let results = stmt
+            .query_map([], |row| {
+                Ok(FileRow {
+                    path: row.get(0)?,
+                    hash: row.get(1)?,
+                    mtime_ms: row.get(2)?,
+                    size: row.get::<_, i64>(3)? as u64,
+                })
+            })?
+            .collect::<SqlResult<Vec<_>>>()?;
+
+        Ok(results)
+    }
+
+    pub fn get_all_chunks(&self) -> SqlResult<Vec<ChunkRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_path, start_line, end_line, text, hash
+             FROM chunks
+             ORDER BY id",
+        )?;
+
+        let results = stmt
+            .query_map([], |row| {
+                Ok(ChunkRow {
+                    id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    start_line: row.get::<_, i64>(2)? as usize,
+                    end_line: row.get::<_, i64>(3)? as usize,
+                    text: row.get(4)?,
+                    hash: row.get(5)?,
+                })
+            })?
+            .collect::<SqlResult<Vec<_>>>()?;
+
+        Ok(results)
+    }
+
+    pub fn clear_all(&self) -> SqlResult<()> {
+        self.conn.execute("DELETE FROM hnsw_nodes", [])?;
+        self.conn.execute("DELETE FROM chunks", [])?;
+        self.conn.execute("DELETE FROM files", [])?;
+        self.conn
+            .execute("DELETE FROM sqlite_sequence WHERE name = 'chunks'", [])
+            .ok();
+        Ok(())
+    }
+
+    pub fn save_hnsw_graph(
+        &self,
+        nodes: &[crate::hnsw::SerializedHnswNode],
+    ) -> Result<(), StorageError> {
+        self.clear_hnsw_graph()?;
+
+        let mut stmt = self
+            .conn
+            .prepare("INSERT INTO hnsw_nodes (position, id, neighbors) VALUES (?1, ?2, ?3)")?;
+        for (position, (id, neighbors)) in nodes.iter().enumerate() {
+            let neighbors_json = serde_json::to_string(neighbors)?;
+            stmt.execute(params![position as i64, *id as i64, neighbors_json])?;
+        }
+
+        Ok(())
+    }
+
+    pub fn load_hnsw_graph(&self) -> Result<Vec<crate::hnsw::SerializedHnswNode>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, neighbors FROM hnsw_nodes ORDER BY position ASC")?;
+
+        let results = stmt
+            .query_map([], |row| {
+                let id = row.get::<_, i64>(0)? as usize;
+                let neighbors_json: String = row.get(1)?;
+                Ok((id, neighbors_json))
+            })?
+            .collect::<SqlResult<Vec<_>>>()?;
+
+        results
+            .into_iter()
+            .map(|(id, neighbors_json)| {
+                let neighbors = serde_json::from_str(&neighbors_json)?;
+                Ok((id, neighbors))
+            })
+            .collect()
+    }
+
+    pub fn clear_hnsw_graph(&self) -> Result<(), StorageError> {
+        self.conn.execute("DELETE FROM hnsw_nodes", [])?;
+        Ok(())
+    }
+
+    pub fn insert_chunk_with_id(&self, chunk: &ChunkRow) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT INTO chunks (id, file_path, start_line, end_line, text, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                chunk.id,
+                chunk.file_path,
+                chunk.start_line as i64,
+                chunk.end_line as i64,
+                chunk.text,
+                chunk.hash,
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn file_count(&self) -> SqlResult<usize> {
@@ -269,6 +398,14 @@ pub struct EmbeddingRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct FileRow {
+    pub path: String,
+    pub hash: String,
+    pub mtime_ms: f64,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct ChunkRow {
     pub id: i64,
     pub file_path: String,
@@ -286,41 +423,53 @@ impl StorageBackend for MemoryDb {
         mtime_ms: f64,
         size: u64,
     ) -> Result<(), StorageError> {
-        self.upsert_file(path, hash, mtime_ms, size)?;
+        MemoryDb::upsert_file(self, path, hash, mtime_ms, size)?;
         Ok(())
     }
     fn get_file_hash(&self, path: &str) -> Result<Option<String>, StorageError> {
-        Ok(self.get_file_hash(path)?)
+        Ok(MemoryDb::get_file_hash(self, path)?)
     }
     fn delete_file(&self, path: &str) -> Result<(), StorageError> {
-        self.delete_file(path)?;
+        MemoryDb::delete_file(self, path)?;
         Ok(())
     }
     fn insert_chunks(&self, file_path: &str, chunks: &[MemoryChunk]) -> Result<(), StorageError> {
-        self.insert_chunks(file_path, chunks)?;
+        MemoryDb::insert_chunks(self, file_path, chunks)?;
         Ok(())
     }
     fn update_embedding(&self, chunk_id: i64, embedding: &[f64]) -> Result<(), StorageError> {
-        self.update_embedding(chunk_id, embedding)?;
+        MemoryDb::update_embedding(self, chunk_id, embedding)?;
         Ok(())
     }
     fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<FtsResult>, StorageError> {
-        Ok(self.search_fts(query, limit)?)
+        Ok(MemoryDb::search_fts(self, query, limit)?)
     }
     fn get_all_embeddings(&self) -> Result<Vec<EmbeddingRow>, StorageError> {
-        Ok(self.get_all_embeddings()?)
+        Ok(MemoryDb::get_all_embeddings(self)?)
     }
     fn get_chunks_without_embedding(&self) -> Result<Vec<ChunkRow>, StorageError> {
-        Ok(self.get_chunks_without_embedding()?)
+        Ok(MemoryDb::get_chunks_without_embedding(self)?)
     }
     fn file_count(&self) -> Result<usize, StorageError> {
-        Ok(self.file_count()?)
+        Ok(MemoryDb::file_count(self)?)
     }
     fn chunk_count(&self) -> Result<usize, StorageError> {
-        Ok(self.chunk_count()?)
+        Ok(MemoryDb::chunk_count(self)?)
     }
     fn all_file_paths(&self) -> Result<Vec<String>, StorageError> {
-        Ok(self.all_file_paths()?)
+        Ok(MemoryDb::all_file_paths(self)?)
+    }
+    fn save_hnsw_graph(
+        &self,
+        nodes: &[crate::hnsw::SerializedHnswNode],
+    ) -> Result<(), StorageError> {
+        MemoryDb::save_hnsw_graph(self, nodes)
+    }
+    fn load_hnsw_graph(&self) -> Result<Vec<crate::hnsw::SerializedHnswNode>, StorageError> {
+        MemoryDb::load_hnsw_graph(self)
+    }
+    fn clear_hnsw_graph(&self) -> Result<(), StorageError> {
+        MemoryDb::clear_hnsw_graph(self)
     }
 }
 
@@ -420,5 +569,27 @@ mod tests {
 
         let parsed: Vec<f64> = serde_json::from_str(&with[0].embedding_json).unwrap();
         assert_eq!(parsed, vec![0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn test_hnsw_graph_roundtrip() {
+        let db = MemoryDb::open_in_memory().unwrap();
+        let nodes = vec![(42, vec![7, 11]), (7, vec![42]), (11, vec![42])];
+
+        db.save_hnsw_graph(&nodes).unwrap();
+        assert_eq!(db.load_hnsw_graph().unwrap(), nodes);
+
+        db.clear_hnsw_graph().unwrap();
+        assert!(db.load_hnsw_graph().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_clear_all_removes_hnsw_graph() {
+        let db = MemoryDb::open_in_memory().unwrap();
+        db.save_hnsw_graph(&[(1, vec![2]), (2, vec![1])]).unwrap();
+        assert_eq!(db.load_hnsw_graph().unwrap().len(), 2);
+
+        db.clear_all().unwrap();
+        assert!(db.load_hnsw_graph().unwrap().is_empty());
     }
 }

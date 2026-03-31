@@ -6,7 +6,6 @@ use axum::{
     routing::get,
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
@@ -167,28 +166,30 @@ async fn api_sync(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
-pub async fn run_web_server(
-    workspace_dir: PathBuf,
-    port: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = ManagerConfig {
-        workspace_dir,
-        ..Default::default()
-    };
-    let manager = MemoryIndexManager::new(config)?;
-    manager.sync()?;
-
-    let state = Arc::new(AppState {
-        manager: std::sync::Mutex::new(manager),
-    });
-
-    let app = Router::new()
+fn build_app(state: Arc<AppState>) -> Router {
+    Router::new()
         .route("/", get(index_page))
         .route("/api/search", get(api_search))
         .route("/api/status", get(api_status))
         .route("/api/sync", get(api_sync))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state)
+}
+
+pub fn build_web_app(config: ManagerConfig) -> Result<Router, crate::manager::ManagerError> {
+    let manager = MemoryIndexManager::new(config)?;
+    manager.sync()?;
+
+    Ok(build_app(Arc::new(AppState {
+        manager: std::sync::Mutex::new(manager),
+    })))
+}
+
+pub async fn run_web_server(
+    config: ManagerConfig,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let app = build_web_app(config)?;
 
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
     println!("rustclaw web UI: http://127.0.0.1:{port}");
