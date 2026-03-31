@@ -27,6 +27,7 @@ pub trait EmbeddingProvider: Send + Sync {
 pub enum EmbeddingProviderKind {
     Openai,
     Gemini,
+    Ollama,
 }
 
 impl std::fmt::Display for EmbeddingProviderKind {
@@ -34,6 +35,7 @@ impl std::fmt::Display for EmbeddingProviderKind {
         match self {
             EmbeddingProviderKind::Openai => write!(f, "openai"),
             EmbeddingProviderKind::Gemini => write!(f, "gemini"),
+            EmbeddingProviderKind::Ollama => write!(f, "ollama"),
         }
     }
 }
@@ -47,6 +49,7 @@ pub fn create_embedding_provider(
     match kind {
         EmbeddingProviderKind::Openai => Ok(Box::new(OpenAiProvider::new(api_key, model)?)),
         EmbeddingProviderKind::Gemini => Ok(Box::new(GeminiProvider::new(api_key, model)?)),
+        EmbeddingProviderKind::Ollama => Ok(Box::new(OllamaProvider::new(api_key, model)?)),
     }
 }
 
@@ -246,5 +249,70 @@ impl EmbeddingProvider for GeminiProvider {
 
     fn dimensions(&self) -> Option<usize> {
         Some(768)
+    }
+}
+
+// --- Ollama Provider (local LLM) ---
+
+/// Embedding provider for Ollama (local LLM server).
+/// Default model: `nomic-embed-text`. No API key required.
+/// Set `OLLAMA_HOST` to override the default URL (http://localhost:11434).
+pub struct OllamaProvider {
+    client: Client,
+    base_url: String,
+    model: String,
+}
+
+#[derive(Serialize)]
+struct OllamaEmbedRequest {
+    model: String,
+    input: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct OllamaEmbedResponse {
+    embeddings: Vec<Vec<f64>>,
+}
+
+impl OllamaProvider {
+    pub fn new(_api_key: Option<String>, model: Option<String>) -> Result<Self, EmbeddingError> {
+        let base_url =
+            std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+        Ok(Self {
+            client: Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()?,
+            base_url,
+            model: model.unwrap_or_else(|| "nomic-embed-text".to_string()),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for OllamaProvider {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f64>>, EmbeddingError> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+        let body = OllamaEmbedRequest {
+            model: self.model.clone(),
+            input: texts.to_vec(),
+        };
+        let url = format!("{}/api/embed", self.base_url);
+        let resp = self.client.post(&url).json(&body).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(EmbeddingError::Api {
+                status: status.as_u16(),
+                message: text,
+            });
+        }
+        let data: OllamaEmbedResponse = resp.json().await?;
+        Ok(data.embeddings)
+    }
+
+    fn name(&self) -> &str {
+        "ollama"
     }
 }
