@@ -6,18 +6,19 @@ Rust port of [OpenClaw](https://github.com/openclaw/openclaw)'s memory system.
 
 ## Features
 
-- **Hybrid Search** - Combines FTS5 keyword search (BM25) with vector similarity search
-- **HNSW Index** - Approximate nearest neighbor search for fast vector queries
+- **Hybrid Search** - FTS5 keyword search (BM25) + vector similarity search
+- **HNSW Index** - Approximate nearest neighbor for fast vector queries
 - **MMR Re-ranking** - Maximal Marginal Relevance for diversity-aware results
 - **Temporal Decay** - Exponential time decay with configurable half-life
-- **SIMD Cosine Similarity** - Vectorized similarity computation via `wide`
-- **Incremental Embedding** - Only embeds new/changed chunks
-- **Embedding API** - OpenAI and Gemini embedding integration
+- **SIMD Cosine Similarity** - Vectorized computation via `wide`
+- **Plugin System** - Swappable embedding providers and storage backends via traits
+- **Cron Scheduler** - at/every/cron job scheduling with backoff and persistence
+- **Embedding API** - OpenAI and Gemini (pluggable via `EmbeddingProvider` trait)
 - **Session Indexing** - JSONL conversation log parsing and search
-- **MCP Server** - Model Context Protocol server for Claude Code integration
-- **Web UI** - Browser-based search interface with live results
+- **MCP Server** - Model Context Protocol for Claude Code integration
+- **Web UI** - Browser-based search with live results
 - **File Watcher** - Auto-sync on memory file changes via `notify`
-- **SQLite + FTS5** - Persistent storage with full-text search
+- **SQLite + FTS5** - Persistent storage (pluggable via `StorageBackend` trait)
 
 ## Install
 
@@ -77,20 +78,76 @@ Available tools:
 - `memory_status` - Get index status
 - `read_memory_file` - Read a memory file by path
 
+### Cron Scheduler
+
+```bash
+# Add a job (interval: 5m, 1h, 30s)
+rustclaw -w /path/to/workspace cron add "sync-job" "5m" "rustclaw -w /path/to/workspace sync"
+
+# Add a job (cron expression)
+rustclaw -w /path/to/workspace cron add "hourly-embed" "0 0 * * * *" "rustclaw -w /path/to/workspace embed --provider openai"
+
+# Add a one-shot job (ISO datetime)
+rustclaw -w /path/to/workspace cron add "once" "2026-04-02T10:00:00Z" "echo done"
+
+# List jobs
+rustclaw -w /path/to/workspace cron list
+
+# Remove a job
+rustclaw -w /path/to/workspace cron remove <id>
+
+# Run the scheduler
+rustclaw -w /path/to/workspace cron run
+```
+
+Features: exponential backoff on errors, one-shot auto-disable, SHA-256 deterministic stagger, JSON persistence.
+
+## Plugin System
+
+### Custom Embedding Provider
+
+```rust
+use rustclaw::embedding::{EmbeddingProvider, EmbeddingError};
+
+struct MyProvider;
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for MyProvider {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f64>>, EmbeddingError> {
+        // your implementation
+    }
+    fn name(&self) -> &str { "my-provider" }
+    fn dimensions(&self) -> Option<usize> { Some(768) }
+}
+```
+
+### Custom Storage Backend
+
+```rust
+use rustclaw::sqlite::{StorageBackend, StorageError, FtsResult, EmbeddingRow, ChunkRow};
+
+struct MyStorage;
+
+impl StorageBackend for MyStorage {
+    // implement all trait methods
+}
+```
+
 ## Architecture
 
 ```
 rustclaw
 ├── internal.rs        # Markdown chunking, hashing, file scanning
-├── sqlite.rs          # SQLite storage + FTS5 full-text search
+├── sqlite.rs          # SQLite storage + FTS5 (StorageBackend trait)
 ├── hnsw.rs            # HNSW approximate nearest neighbor index
 ├── simd.rs            # SIMD-accelerated cosine similarity
 ├── mmr.rs             # Maximal Marginal Relevance re-ranking
 ├── temporal_decay.rs  # Exponential time decay scoring
 ├── hybrid.rs          # Vector + keyword search merge (BM25)
-├── embedding.rs       # OpenAI / Gemini embedding API client
+├── embedding.rs       # Embedding API (EmbeddingProvider trait)
 ├── sessions.rs        # JSONL session file parser
 ├── manager.rs         # Orchestrator (sync, search, embed, HNSW)
+├── cron/              # Cron scheduler (schedule, store, service)
 ├── mcp.rs             # MCP server (JSON-RPC over stdio)
 ├── web.rs             # Web UI (axum)
 ├── watcher.rs         # File change watcher (notify)
@@ -112,8 +169,6 @@ Query
 
 ## Memory File Format
 
-rustclaw indexes markdown files following the OpenClaw memory convention:
-
 ```
 workspace/
 ├── MEMORY.md          # Main index file
@@ -127,7 +182,7 @@ workspace/
 
 ## Benchmarks
 
-On a typical workstation (release build):
+Release build on a typical workstation:
 
 | Operation | Performance |
 |---|---|

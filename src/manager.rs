@@ -27,6 +27,8 @@ pub enum ManagerError {
     Embedding(#[from] EmbeddingError),
 }
 
+/// Core memory index manager. Orchestrates file sync, chunking, embedding,
+/// and hybrid search across memory files and sessions.
 pub struct MemoryIndexManager {
     db: MemoryDb,
     workspace_dir: PathBuf,
@@ -410,6 +412,27 @@ impl MemoryIndexManager {
             workspace_dir: self.workspace_dir.to_string_lossy().into_owned(),
         })
     }
+}
+
+/// Multi-workspace search: search across multiple workspace indexes and merge results.
+pub fn search_multi(
+    managers: &[&MemoryIndexManager],
+    query: &str,
+    max_results: usize,
+    min_score: f64,
+) -> Result<Vec<MemorySearchResult>, ManagerError> {
+    let mut all_results = Vec::new();
+    for manager in managers {
+        let results = manager.search(query, None, max_results, min_score)?;
+        all_results.extend(results);
+    }
+    all_results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    all_results.truncate(max_results);
+    Ok(all_results)
 }
 
 #[derive(Debug)]

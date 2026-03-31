@@ -4,6 +4,7 @@ use std::path::Path;
 use crate::types::MemoryChunk;
 
 /// Trait for pluggable storage backends.
+/// Implement this trait to use a custom storage engine (e.g., PostgreSQL, DuckDB).
 pub trait StorageBackend {
     fn upsert_file(
         &self,

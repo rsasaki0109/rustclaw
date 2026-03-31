@@ -13,6 +13,7 @@ pub enum EmbeddingError {
 }
 
 /// Trait for pluggable embedding providers.
+/// Implement this to add support for custom embedding APIs (e.g., Ollama, Cohere, local models).
 #[async_trait::async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f64>>, EmbeddingError>;

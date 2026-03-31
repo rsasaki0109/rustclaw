@@ -1,3 +1,20 @@
+//! # rustclaw
+//!
+//! Memory search engine with hybrid vector/keyword search, MMR re-ranking,
+//! and temporal decay. Rust port of OpenClaw's memory system.
+//!
+//! ## Core modules
+//! - [`manager`] - Main orchestrator for sync, search, and embedding
+//! - [`sqlite`] - SQLite storage with FTS5 full-text search ([`sqlite::StorageBackend`] trait)
+//! - [`embedding`] - Pluggable embedding providers ([`embedding::EmbeddingProvider`] trait)
+//! - [`hybrid`] - Hybrid vector + keyword search merge
+//! - [`hnsw`] - HNSW approximate nearest neighbor index
+//! - [`mmr`] - Maximal Marginal Relevance re-ranking
+//! - [`temporal_decay`] - Exponential time decay scoring
+//! - [`cron`] - Cron job scheduler
+//! - [`mcp`] - MCP server for Claude Code integration
+//! - [`web`] - Web UI server
+
 pub mod cron;
 pub mod embedding;
 pub mod hnsw;

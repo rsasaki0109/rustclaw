@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
+use crate::cron::store::CronJobStore;
+use crate::cron::types::{CronJob, CronJobState, CronSchedule};
 use crate::manager::{ManagerConfig, ManagerError, MemoryIndexManager};
 
 /// MCP (Model Context Protocol) server for rustclaw.
@@ -117,6 +119,38 @@ fn tool_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["path"]
+            }),
+        },
+        ToolDefinition {
+            name: "cron_list".to_string(),
+            description: "List all cron jobs".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        ToolDefinition {
+            name: "cron_add".to_string(),
+            description: "Add a cron job. Schedule can be interval (5m, 1h), cron expression, or ISO datetime".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Job name" },
+                    "schedule": { "type": "string", "description": "Schedule: interval (5m), cron (0 * * * *), or ISO datetime" },
+                    "command": { "type": "string", "description": "Shell command to execute" }
+                },
+                "required": ["name", "schedule", "command"]
+            }),
+        },
+        ToolDefinition {
+            name: "cron_remove".to_string(),
+            description: "Remove a cron job by ID".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Job ID" }
+                },
+                "required": ["id"]
             }),
         },
     ]
@@ -285,6 +319,108 @@ fn handle_request(
                     }
                 }
 
+                "cron_list" => {
+                    let store_path = workspace_dir.join(".rustclaw").join("cron_jobs.json");
+                    let store = CronJobStore::new(store_path);
+                    match store.load() {
+                        Ok(jobs) => {
+                            let text = if jobs.is_empty() {
+                                "No cron jobs.".to_string()
+                            } else {
+                                jobs.iter()
+                                    .map(|j| {
+                                        let status = if j.enabled { "enabled" } else { "disabled" };
+                                        format!(
+                                            "{} [{}] {} | {} | {}",
+                                            j.id, status, j.name, j.schedule, j.command
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            };
+                            make_response(
+                                req.id.clone(),
+                                serde_json::json!({
+                                    "content": [{ "type": "text", "text": text }]
+                                }),
+                            )
+                        }
+                        Err(e) => make_error(req.id.clone(), -32000, format!("Failed: {e}")),
+                    }
+                }
+
+                "cron_add" => {
+                    #[derive(Deserialize)]
+                    struct CronAddParams {
+                        name: String,
+                        schedule: String,
+                        command: String,
+                    }
+                    let p: CronAddParams = match serde_json::from_value(arguments) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return make_error(
+                                req.id.clone(),
+                                -32602,
+                                format!("Invalid params: {e}"),
+                            );
+                        }
+                    };
+                    let cron_schedule = parse_schedule_input(&p.schedule);
+                    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+                    let job = CronJob {
+                        id: id.clone(),
+                        name: p.name,
+                        schedule: cron_schedule,
+                        command: p.command,
+                        enabled: true,
+                        state: CronJobState::default(),
+                        max_retries: 3,
+                    };
+                    let store_path = workspace_dir.join(".rustclaw").join("cron_jobs.json");
+                    let store = CronJobStore::new(store_path);
+                    match store.add_job(job) {
+                        Ok(()) => make_response(
+                            req.id.clone(),
+                            serde_json::json!({
+                                "content": [{ "type": "text", "text": format!("Added job {id}") }]
+                            }),
+                        ),
+                        Err(e) => make_error(req.id.clone(), -32000, format!("Failed: {e}")),
+                    }
+                }
+
+                "cron_remove" => {
+                    #[derive(Deserialize)]
+                    struct CronRemoveParams {
+                        id: String,
+                    }
+                    let p: CronRemoveParams = match serde_json::from_value(arguments) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return make_error(
+                                req.id.clone(),
+                                -32602,
+                                format!("Invalid params: {e}"),
+                            );
+                        }
+                    };
+                    let store_path = workspace_dir.join(".rustclaw").join("cron_jobs.json");
+                    let store = CronJobStore::new(store_path);
+                    match store.remove_job(&p.id) {
+                        Ok(true) => make_response(
+                            req.id.clone(),
+                            serde_json::json!({
+                                "content": [{ "type": "text", "text": format!("Removed job {}", p.id) }]
+                            }),
+                        ),
+                        Ok(false) => {
+                            make_error(req.id.clone(), -32000, format!("Job {} not found", p.id))
+                        }
+                        Err(e) => make_error(req.id.clone(), -32000, format!("Failed: {e}")),
+                    }
+                }
+
                 _ => make_error(req.id.clone(), -32601, format!("Unknown tool: {tool_name}")),
             }
         }
@@ -299,6 +435,41 @@ fn handle_request(
             -32601,
             format!("Method not found: {}", req.method),
         ),
+    }
+}
+
+fn parse_schedule_input(s: &str) -> CronSchedule {
+    // Interval: "5m", "1h", "30s"
+    if let Some(ms) = parse_interval_ms(s) {
+        return CronSchedule::Every {
+            every_ms: ms,
+            anchor_ms: None,
+        };
+    }
+    // ISO datetime
+    if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+        return CronSchedule::At { at: s.to_string() };
+    }
+    // Cron expression
+    CronSchedule::Cron {
+        expr: s.to_string(),
+        tz: None,
+    }
+}
+
+fn parse_interval_ms(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.len() < 2 {
+        return None;
+    }
+    let (num, unit) = s.split_at(s.len() - 1);
+    let n: u64 = num.parse().ok()?;
+    match unit {
+        "s" => Some(n * 1000),
+        "m" => Some(n * 60_000),
+        "h" => Some(n * 3_600_000),
+        "d" => Some(n * 86_400_000),
+        _ => None,
     }
 }
 
