@@ -1,8 +1,10 @@
 [package]
 name = "rustclaw"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Memory search engine with hybrid vector/keyword search, MMR re-ranking, and temporal decay - Rust port of OpenClaw's memory system"
+license = "MIT"
+repository = "https://github.com/rsasaki0109/rustclaw"
 
 [dependencies]
 sha2 = "0.10"
@@ -17,6 +19,12 @@ clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", features = ["json"] }
 notify = "8"
 wide = "0.7"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[[example]]
+name = "search_bench"
+path = "examples/search_bench.rs"

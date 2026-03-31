@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use rustclaw::embedding::{EmbeddingClient, EmbeddingProvider};
 use rustclaw::manager::{ManagerConfig, MemoryIndexManager};
+use rustclaw::mcp::run_mcp_server;
 use rustclaw::watcher::MemoryWatcher;
+use rustclaw::web::run_web_server;
 
 #[derive(Parser)]
 #[command(name = "rustclaw", version, about = "Memory search engine with hybrid vector/keyword search")]
@@ -71,6 +73,16 @@ enum Commands {
 
     /// Watch for file changes and auto-sync
     Watch,
+
+    /// Start MCP server (stdin/stdout JSON-RPC)
+    Mcp,
+
+    /// Start web UI server
+    Serve {
+        /// Port to listen on
+        #[arg(short, long, default_value = "3179")]
+        port: u16,
+    },
 }
 
 #[tokio::main]
@@ -262,6 +274,20 @@ async fn main() {
             // Block until Ctrl+C
             tokio::signal::ctrl_c().await.ok();
             println!("\nstopping...");
+        }
+
+        Commands::Mcp => {
+            if let Err(e) = run_mcp_server(workspace_dir) {
+                eprintln!("MCP server error: {e}");
+                std::process::exit(1);
+            }
+        }
+
+        Commands::Serve { port } => {
+            if let Err(e) = run_web_server(workspace_dir, port).await {
+                eprintln!("Web server error: {e}");
+                std::process::exit(1);
+            }
         }
     }
 }
